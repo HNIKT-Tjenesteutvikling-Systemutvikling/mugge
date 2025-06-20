@@ -5,6 +5,7 @@ import cats.effect.std.Queue
 import cats.syntax.all.*
 import fs2.*
 import fs2.io.net.*
+import fs2.Stream
 import com.comcast.ip4s.*
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -26,11 +27,12 @@ object ChatServer extends IOApp:
       clients <- Ref.of[IO, Map[String, Client]](Map.empty)
       _ <- Network[IO]
         .server(Some(host), Some(port))
-        .map { clientSocket =>
-          handleClient(clientSocket, clients)
-            .handleErrorWith(err => IO.println(s"Client error: ${err.getMessage}"))
+        .flatMap { clientSocket =>
+          Stream.eval(
+            handleClient(clientSocket, clients)
+              .handleErrorWith(err => IO.println(s"Client error: ${err.getMessage}"))
+          )
         }
-        .parJoinUnbounded
         .compile
         .drain
     yield ExitCode.Success
@@ -44,11 +46,14 @@ object ChatServer extends IOApp:
       _ <- IO.println(s"Client $clientId connected")
       _ <- socket.write(Chunk.from(s"Welcome! Your ID is: $clientId\n".getBytes))
       _ <- (
-        readFromClient(client, clients)
+        Stream
+          .eval(readFromClient(client, clients))
           .concurrently(
-            writeToClient(client)
+            Stream.eval(writeToClient(client))
           )
         )
+        .compile
+        .drain
         .guarantee(
           removeClient(clientId, clients)
         )
