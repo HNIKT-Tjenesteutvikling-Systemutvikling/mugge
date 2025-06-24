@@ -11,12 +11,6 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.io.IOException
 
-case class Client(
-    id: String,
-    queue: Queue[IO, Message],
-    socket: Socket[IO]
-)
-
 object ChatServer extends IOApp:
 
   private val port = port"5555"
