@@ -9,6 +9,7 @@ import fs2.Stream
 import com.comcast.ip4s.*
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.io.IOException
 
 case class Client(
     id: String,
@@ -39,7 +40,10 @@ object ChatServer extends IOApp:
 
   private def handleClient(socket: Socket[IO], clients: Ref[IO, Map[String, Client]]): IO[Unit] =
     for
-      clientId <- IO(java.util.UUID.randomUUID().toString.take(8))
+      hostnameChunk <- socket.read(8192)
+      hostname <- IO.fromOption(hostnameChunk)(new IOException("Client disconnected"))
+      rawHostname = hostname.toArray.map(_.toChar).mkString.trim
+      clientId = mapHostname(rawHostname)
       queue <- Queue.unbounded[IO, Message]
       client = Client(clientId, queue, socket)
       _ <- clients.update(_ + (clientId -> client))
@@ -111,3 +115,8 @@ object ChatServer extends IOApp:
         if remainingClients.nonEmpty then broadcastMessage(disconnectMessage, clients)
         else IO.unit
     yield ()
+
+  private def mapHostname(hostname: String): String =
+    hostname match
+      case "terangreal" => "Knut"
+      case other        => other

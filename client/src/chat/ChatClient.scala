@@ -34,35 +34,57 @@ object ChatClient extends IOApp:
       }
 
   private def handleConnection(socket: Socket[IO]): IO[Unit] =
-    Queue.unbounded[IO, String].flatMap { outgoingQueue =>
-      val readFromServer = socket.reads
-        .through(text.utf8.decode)
-        .through(text.lines)
-        .filter(_.nonEmpty)
-        .evalMap(msg => IO.println(s"\r$msg"))
-        .compile
-        .drain
+    for
+      _ <- sendHostname(socket)
+      _ <- handleChat(socket)
+    yield ()
 
-      val readFromUser = Stream
-        .repeatEval(Console[IO].readLine)
-        .takeWhile(_ != "/quit")
-        .evalMap(line => outgoingQueue.offer(line))
-        .compile
-        .drain
-
-      val writeToServer = Stream
-        .fromQueueUnterminated(outgoingQueue)
-        .map(_ + "\n")
+  private def sendHostname(socket: Socket[IO]): IO[Unit] =
+    for
+      hostname <- IO
+        .blocking(java.net.InetAddress.getLocalHost.getHostName)
+        .handleError(_ => "unknown-client")
+      _ <- Stream
+        .emit(hostname + "\n")
         .through(text.utf8.encode)
         .through(socket.writes)
         .compile
         .drain
+    yield ()
 
-      readFromServer
-        .both(readFromUser)
-        .both(writeToServer)
-        .void
-        .handleErrorWith { err =>
-          IO.println(s"\nConnection error: ${err.getMessage}")
-        }
+  private def handleChat(socket: Socket[IO]): IO[Unit] =
+    Queue.unbounded[IO, String].flatMap { outgoingQueue =>
+      val serverReader = readFromServer(socket)
+      val userReader = readFromUser(outgoingQueue)
+      val serverWriter = writeToServer(socket, outgoingQueue)
+
+      serverReader.both(userReader).both(serverWriter).void.handleErrorWith { err =>
+        IO.println(s"\nConnection error: ${err.getMessage}")
+      }
     }
+
+  private def readFromServer(socket: Socket[IO]): IO[Unit] =
+    socket.reads
+      .through(text.utf8.decode)
+      .through(text.lines)
+      .filter(_.nonEmpty)
+      .evalMap(msg => IO.println(s"\r$msg"))
+      .compile
+      .drain
+
+  private def readFromUser(outgoingQueue: Queue[IO, String]): IO[Unit] =
+    Stream
+      .repeatEval(Console[IO].readLine)
+      .takeWhile(_ != "/quit")
+      .evalMap(line => outgoingQueue.offer(line))
+      .compile
+      .drain
+
+  private def writeToServer(socket: Socket[IO], outgoingQueue: Queue[IO, String]): IO[Unit] =
+    Stream
+      .fromQueueUnterminated(outgoingQueue)
+      .map(_ + "\n")
+      .through(text.utf8.encode)
+      .through(socket.writes)
+      .compile
+      .drain
