@@ -24,6 +24,7 @@
           customJava = inputs.kvalreg-dev-env.packages.${system}.java;
           commonInputs = [
             pkgs.maven
+            pkgs.libnotify
           ];
 
           jvmInputs = with pkgs; [

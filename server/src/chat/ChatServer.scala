@@ -37,7 +37,7 @@ object ChatServer extends IOApp:
       hostnameChunk <- socket.read(8192)
       hostname <- IO.fromOption(hostnameChunk)(new IOException("Client disconnected"))
       rawHostname = hostname.toArray.map(_.toChar).mkString.trim
-      clientId = mapHostname(rawHostname)
+      clientId = UserMapping.mapHostname(rawHostname) // Use shared mapping
       queue <- Queue.unbounded[IO, Message]
       client = Client(clientId, queue, socket)
       _ <- clients.update(_ + (clientId -> client))
@@ -109,8 +109,3 @@ object ChatServer extends IOApp:
         if remainingClients.nonEmpty then broadcastMessage(disconnectMessage, clients)
         else IO.unit
     yield ()
-
-  private def mapHostname(hostname: String): String =
-    hostname match
-      case "terangreal" => "Knut"
-      case other        => other
