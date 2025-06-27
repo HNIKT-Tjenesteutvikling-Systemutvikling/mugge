@@ -5,5 +5,6 @@ import java.time.LocalDateTime
 case class Message(
     timestamp: LocalDateTime,
     clientId: String,
-    content: String
+    content: String,
+    authenticated: Boolean = false
 )

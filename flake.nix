@@ -25,6 +25,7 @@
           commonInputs = [
             pkgs.maven
             pkgs.libnotify
+            pkgs.openssl
           ];
 
           jvmInputs = with pkgs; [

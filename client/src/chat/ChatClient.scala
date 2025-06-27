@@ -9,11 +9,18 @@ import com.comcast.ip4s.*
 import java.io.IOException
 import scala.sys.process.*
 import scala.concurrent.duration.*
+import java.security.*
 
 object ChatClient extends IOApp:
 
   private val serverPort = port"5555"
   private val serverHost = host"localhost"
+
+  case class ClientState(
+      authenticated: Boolean = false,
+      githubUsername: Option[String] = None,
+      privateKey: Option[PrivateKey] = None
+  )
 
   def run(args: List[String]): IO[ExitCode] =
     val host = args.headOption.map(Host.fromString).flatten.getOrElse(serverHost)
@@ -21,17 +28,22 @@ object ChatClient extends IOApp:
 
     for
       myUsername <- getUsername
+      githubUsername <- Authentication.detectGithubUsername()
+      _ <- githubUsername match
+        case Some(ghu) => IO.println(s"Detected GitHub username: $ghu")
+        case None      => IO.println("Could not detect GitHub username from git config")
+
       exitCode <- Network[IO]
         .client(SocketAddress(host, port))
         .use { socket =>
           for
-            _ <- IO.println(s"Connected to chat server at $host:$port")
-            _ <- IO.println(s"You are logged in as: $myUsername")
-            _ <- IO.println("Type your messages and press Enter to send. Type '/quit' to exit.")
-            _ <- IO.println(
-              "Use !ping @username [count] to send critical notifications (default: 1, max: 10)."
+            _ <- IO.println(s"Connecting to chat server at $host:$port...")
+            state <- Ref.of[IO, ClientState](
+              ClientState(
+                githubUsername = githubUsername
+              )
             )
-            _ <- handleConnection(socket, myUsername)
+            _ <- handleConnection(socket, myUsername, state)
           yield ExitCode.Success
         }
         .handleErrorWith {
@@ -46,28 +58,59 @@ object ChatClient extends IOApp:
     IO.blocking(java.net.InetAddress.getLocalHost.getHostName)
       .map(UserMapping.mapHostname)
 
-  private def handleConnection(socket: Socket[IO], myUsername: String): IO[Unit] =
+  private def handleConnection(
+      socket: Socket[IO],
+      myUsername: String,
+      state: Ref[IO, ClientState]
+  ): IO[Unit] =
     for
-      _ <- sendHostname(socket)
-      _ <- handleChat(socket, myUsername)
+      _ <- sendInitialData(socket, state)
+      _ <- handleChat(socket, myUsername, state)
     yield ()
 
-  private def sendHostname(socket: Socket[IO]): IO[Unit] =
+  private def sendInitialData(socket: Socket[IO], state: Ref[IO, ClientState]): IO[Unit] =
     for
       hostname <- IO
         .blocking(java.net.InetAddress.getLocalHost.getHostName)
         .handleError(_ => "unknown-client")
+      currentState <- state.get
+
+      // Try to load private key if we have a GitHub username
+      privateKey <- currentState.githubUsername match
+        case Some(ghu) =>
+          Authentication
+            .loadPrivateKey()
+            .map(Some(_))
+            .handleError { err =>
+              println(s"Could not load SSH private key: ${err.getMessage}")
+              None
+            }
+        case None => IO.pure(None)
+
+      _ <- privateKey match
+        case Some(key) => state.update(_.copy(privateKey = Some(key)))
+        case None      => IO.unit
+
+      // Send hostname and auto-auth data if available
+      authData = currentState.githubUsername match
+        case Some(ghu) if privateKey.isDefined => s"\nauto-auth:$ghu"
+        case _                                 => ""
+
       _ <- Stream
-        .emit(hostname + "\n")
+        .emit(s"$hostname$authData\n")
         .through(text.utf8.encode)
         .through(socket.writes)
         .compile
         .drain
     yield ()
 
-  private def handleChat(socket: Socket[IO], myUsername: String): IO[Unit] =
+  private def handleChat(
+      socket: Socket[IO],
+      myUsername: String,
+      state: Ref[IO, ClientState]
+  ): IO[Unit] =
     Queue.unbounded[IO, String].flatMap { outgoingQueue =>
-      val serverReader = readFromServer(socket, myUsername)
+      val serverReader = readFromServer(socket, myUsername, state, outgoingQueue)
       val userReader = readFromUser(outgoingQueue)
       val serverWriter = writeToServer(socket, outgoingQueue)
 
@@ -76,20 +119,75 @@ object ChatClient extends IOApp:
       }
     }
 
-  private def readFromServer(socket: Socket[IO], myUsername: String): IO[Unit] =
+  private def readFromServer(
+      socket: Socket[IO],
+      myUsername: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String]
+  ): IO[Unit] =
     socket.reads
       .through(text.utf8.decode)
       .through(text.lines)
       .filter(_.nonEmpty)
       .evalMap { msg =>
-        for
-          _ <- IO.println(s"\r$msg")
-          _ <- checkForMentions(msg, myUsername)
-          _ <- checkForPings(msg, myUsername)
-        yield ()
+        if msg.startsWith("CHALLENGE:") then handleAutoChallenge(msg.drop(10), state, socket)
+        else if msg.startsWith("Challenge: ") then
+          handleManualChallenge(msg.drop(11), state, outgoingQueue)
+        else if msg.contains("Authentication successful!") then
+          state.update(_.copy(authenticated = true)) >>
+            IO.println(s"\r$msg") >>
+            IO.println("You can now start chatting!")
+        else
+          for
+            _ <- IO.println(s"\r$msg")
+            _ <- checkForMentions(msg, myUsername)
+            _ <- checkForPings(msg, myUsername)
+          yield ()
       }
       .compile
       .drain
+
+  private def handleAutoChallenge(
+      challenge: String,
+      state: Ref[IO, ClientState],
+      socket: Socket[IO]
+  ): IO[Unit] =
+    for
+      currentState <- state.get
+      _ <- (currentState.privateKey, currentState.githubUsername) match
+        case (Some(privateKey), Some(githubUsername)) =>
+          for
+            _ <- IO.println(s"Received auto-auth challenge, signing...")
+            signature <- Authentication.signChallenge(challenge, privateKey)
+            _ <- Stream
+              .emit(s"SIGNATURE:$signature\n")
+              .through(text.utf8.encode)
+              .through(socket.writes)
+              .compile
+              .drain
+            _ <- IO.println(s"Auto-authentication response sent for $githubUsername")
+          yield ()
+        case _ =>
+          IO.println("Cannot auto-authenticate: missing private key or GitHub username")
+    yield ()
+
+  private def handleManualChallenge(
+      challenge: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String]
+  ): IO[Unit] =
+    for
+      currentState <- state.get
+      _ <- currentState.privateKey match
+        case Some(privateKey) =>
+          for
+            _ <- IO.println(s"Received authentication challenge, auto-signing...")
+            signature <- Authentication.signChallenge(challenge, privateKey)
+            _ <- outgoingQueue.offer(s"/verify $signature")
+          yield ()
+        case None =>
+          IO.println("Cannot sign challenge: SSH private key not loaded")
+    yield ()
 
   private def readFromUser(outgoingQueue: Queue[IO, String]): IO[Unit] =
     Stream
@@ -109,7 +207,7 @@ object ChatClient extends IOApp:
       .drain
 
   private def checkForMentions(line: String, myUsername: String): IO[Unit] =
-    val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] ([^:]+): (.+)$""".r
+    val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
     val mentionPattern = s"@(\\w+)".r
 
     line match
@@ -129,7 +227,7 @@ object ChatClient extends IOApp:
         IO.unit
 
   private def checkForPings(line: String, myUsername: String): IO[Unit] =
-    val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] ([^:]+): (.+)$""".r
+    val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
     val pingPattern = """^!ping\s+@(\w+)(?:\s+(\d+))?""".r
 
     line match
@@ -138,7 +236,7 @@ object ChatClient extends IOApp:
           case pingPattern(targetUser, countStr) =>
             if targetUser.equalsIgnoreCase(myUsername) then
               val count = Option(countStr).flatMap(_.toIntOption).getOrElse(1)
-              val limitedCount = count.min(10).max(1) // Limit between 1 and 10
+              val limitedCount = count.min(10).max(1)
 
               sendMultiplePings(sender, time, limitedCount)
             else IO.unit
