@@ -28,7 +28,7 @@ object ChatClient extends IOApp:
 
     for
       myUsername <- getUsername
-      githubUsername <- Authentication.detectGithubUsername()
+      githubUsername <- Authentication.detectGithubUsername().flatMap(IO.fromEither)
       _ <- githubUsername match
         case Some(ghu) => IO.println(s"Detected GitHub username: $ghu")
         case None      => IO.println("Could not detect GitHub username from git config")
@@ -75,12 +75,11 @@ object ChatClient extends IOApp:
         .handleError(_ => "unknown-client")
       currentState <- state.get
 
-      // Try to load private key if we have a GitHub username
       privateKey <- currentState.githubUsername match
         case Some(ghu) =>
           Authentication
             .loadPrivateKey()
-            .map(Some(_))
+            .map(_.toOption)
             .handleError { err =>
               println(s"Could not load SSH private key: ${err.getMessage}")
               None
@@ -91,7 +90,6 @@ object ChatClient extends IOApp:
         case Some(key) => state.update(_.copy(privateKey = Some(key)))
         case None      => IO.unit
 
-      // Send hostname and auto-auth data if available
       authData = currentState.githubUsername match
         case Some(ghu) if privateKey.isDefined => s"\nauto-auth:$ghu"
         case _                                 => ""
@@ -158,7 +156,7 @@ object ChatClient extends IOApp:
         case (Some(privateKey), Some(githubUsername)) =>
           for
             _ <- IO.println(s"Received auto-auth challenge, signing...")
-            signature <- Authentication.signChallenge(challenge, privateKey)
+            signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
             _ <- Stream
               .emit(s"SIGNATURE:$signature\n")
               .through(text.utf8.encode)
@@ -182,7 +180,7 @@ object ChatClient extends IOApp:
         case Some(privateKey) =>
           for
             _ <- IO.println(s"Received authentication challenge, auto-signing...")
-            signature <- Authentication.signChallenge(challenge, privateKey)
+            signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
             _ <- outgoingQueue.offer(s"/verify $signature")
           yield ()
         case None =>
@@ -249,8 +247,8 @@ object ChatClient extends IOApp:
 
     (1 to count).toList.traverse_ { i =>
       sendNotification(
-        title = s"🔔 PING from $sender (${i}/$count)",
-        body = s"$sender pinged you at $time",
+        title = s"🔔 Mention from $sender (${i}/$count)",
+        body = s"$sender mentioned you at $time",
         urgency = "critical",
         timeout = 0
       ) >> IO.sleep(delay)

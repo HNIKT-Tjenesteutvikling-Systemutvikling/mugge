@@ -62,7 +62,7 @@ object ChatServer extends IOApp:
           val githubUsername = authLine.drop(10).trim
           for
             _ <- IO.println(s"Client $clientId attempting auto-auth as $githubUsername")
-            challenge <- Authentication.generateChallenge()
+            challenge <- Authentication.generateChallenge().flatMap(IO.fromEither)
             _ <- challenges.update(_ + (clientId -> (challenge, githubUsername)))
             _ <- socket.write(Chunk.from(s"CHALLENGE:$challenge\n".getBytes))
             result <- IO.race(
@@ -134,7 +134,7 @@ object ChatServer extends IOApp:
     for
       keys <- getCachedKeys(githubUsername, keyCache)
       results <- keys.traverse { keyInfo =>
-        Authentication.verifySignature(challenge, signature, keyInfo.key)
+        Authentication.verifySignature(challenge, signature, keyInfo.key).map(_.getOrElse(false))
       }
       verified = results.exists(identity)
       _ <-
@@ -154,8 +154,7 @@ object ChatServer extends IOApp:
       .through(text.lines)
       .filter(_.nonEmpty)
       .evalMap { line =>
-        if line.startsWith("/auth ") then
-          handleAuth(line.drop(6), client, clients, keyCache, challenges)
+        if line.startsWith("/auth ") then handleAuth(line.drop(6), client, keyCache, challenges)
         else if line.startsWith("/verify ") then
           handleVerify(line.drop(8), client, clients, keyCache, challenges)
         else if client.authenticated then
@@ -174,7 +173,6 @@ object ChatServer extends IOApp:
   private def handleAuth(
       githubUsername: String,
       client: Client,
-      clients: Ref[IO, Map[String, Client]],
       keyCache: Ref[IO, KeyCache],
       challenges: Ref[IO, Map[String, (String, String)]]
   ): IO[Unit] =
@@ -192,7 +190,7 @@ object ChatServer extends IOApp:
             sendToClient(client, s"No SSH keys found for GitHub user: $githubUsername")
           else
             for
-              challenge <- Authentication.generateChallenge()
+              challenge <- Authentication.generateChallenge().flatMap(IO.fromEither)
               _ <- challenges.update(_ + (client.id -> (challenge, githubUsername)))
               _ <- sendToClient(client, s"Challenge: $challenge")
               _ <- sendToClient(
@@ -259,9 +257,10 @@ object ChatServer extends IOApp:
             _ <- IO.println(s"Fetching SSH keys for $githubUsername from GitHub")
             freshKeys <- Authentication
               .fetchGithubKeys(githubUsername)
+              .flatMap(IO.fromEither)
               .handleError { err =>
                 println(s"Error fetching keys: ${err.getMessage}")
-                List.empty
+                List.empty[Authentication.PublicKeyInfo]
               }
             _ <- keyCache.update(_ + (githubUsername -> (freshKeys, now)))
           yield freshKeys
