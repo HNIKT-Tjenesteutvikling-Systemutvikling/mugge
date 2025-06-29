@@ -1,0 +1,38 @@
+#+title: Mugge Chat
+
+* About
+
+This project is a chat application written in Scala 3, using cats-effect for concurrency and fs2 for streaming. It's built with bleep.
+
+* Getting Started
+
+** Prerequisites
+
+- [[https://bleep.build/][bleep]]
+- A JVM
+
+** Building the project
+
+To compile the code, run:
+#+begin_src shell
+bleep compile
+#+end_src
+
+** Running the server
+
+#+begin_src shell
+bleep run server
+#+end_src
+
+** Running the client
+
+#+begin_src shell
+bleep run client
+#+end_src
+
+* Project Structure
+
+The project is divided into three main parts:
+- =server=: Contains the server-side logic of the chat application.
+- =client=: Contains the client-side logic for connecting to the chat server.
+- =shared=: Contains the common code shared between the server and the client, such as message formats and network protocols.
