@@ -12,8 +12,14 @@ import sttp.client3.httpclient.cats.HttpClientCatsBackend
 import java.nio.file.{Files, Paths, LinkOption}
 import java.math.BigInteger
 import scala.sys.process.*
+import org.typelevel.log4cats.LoggerFactory
+import org.typelevel.log4cats.slf4j.Slf4jFactory
+import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.{Logger => TLogger}
 
 object Authentication:
+  given LoggerFactory[IO] = Slf4jFactory.create[IO]
+  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
 
   sealed trait AuthError extends Exception:
     def message: String
@@ -152,8 +158,8 @@ object Authentication:
   def loadPrivateKey(
       keyPath: String = s"${System.getProperty("user.home")}/.ssh/id_rsa"
   ): IO[Either[AuthError, PrivateKey]] =
-    (for
-      home <- EitherT.pure[IO, AuthError](System.getProperty("user.home"))
+    for {
+      home <- IO(System.getProperty("user.home"))
       keyPaths = List(
         keyPath,
         s"$home/.config/sops-nix/secrets/private_keys/gako",
@@ -161,37 +167,50 @@ object Authentication:
         s"$home/.ssh/id_ed25519",
         s"$home/.ssh/id_ecdsa"
       )
-      existingKeyPath <- EitherT.fromEither[IO] {
+      existingKeyPath <- IO {
         keyPaths
-          .find { path =>
-            val p = Paths.get(path)
-            val exists = Files.exists(p)
-            if exists then println(s"Found key at: $path")
-            exists
-          }
+          .find(path => Files.exists(Paths.get(path)))
           .toRight(
             KeyLoadError(
               s"No SSH keys found in any of the following locations: ${keyPaths.mkString(", ")}"
             )
           )
+      }.flatTap {
+        case Right(path) => logger.debug(s"Found key at: $path")
+        case Left(_)     => IO.unit
       }
-      keyBytes <- EitherT(IO.blocking {
-        Either
-          .catchNonFatal(Files.readAllBytes(Paths.get(existingKeyPath)))
-          .leftMap(e => KeyLoadError(s"Failed to read key file: ${e.getMessage}"))
-      })
-      keyString = new String(keyBytes)
-      _ = println(s"Reading key from: $existingKeyPath")
-      actualPath <- EitherT(IO.blocking {
-        Either
-          .catchNonFatal(Paths.get(existingKeyPath).toRealPath())
-          .leftMap(e => KeyLoadError(s"Failed to resolve key path: ${e.getMessage}"))
-      })
-      _ = if actualPath.toString != existingKeyPath then
-        println(s"Key is symlinked to: $actualPath")
-      _ = println(s"Key format detected: ${detectKeyFormat(keyString)}")
-      privateKey <- parsePrivateKey(existingKeyPath, keyString)
-    yield privateKey).value
+      result <- existingKeyPath match {
+        case Left(err) => IO.pure(Left(err))
+        case Right(path) =>
+          for {
+            keyBytes <- IO.blocking {
+              Either
+                .catchNonFatal(Files.readAllBytes(Paths.get(path)))
+                .leftMap(e => KeyLoadError(s"Failed to read key file: ${e.getMessage}"))
+            }
+            _ <- logger.debug(s"Reading key from: $path")
+            keyString = keyBytes.map(new String(_))
+            actualPath <- IO.blocking {
+              Either
+                .catchNonFatal(Paths.get(path).toRealPath())
+                .leftMap(e => KeyLoadError(s"Failed to resolve key path: ${e.getMessage}"))
+            }
+            _ <- actualPath match {
+              case Right(ap) if ap.toString != path =>
+                logger.debug(s"Key is symlinked to: $ap")
+              case _ => IO.unit
+            }
+            _ <- keyString match {
+              case Right(str) => logger.debug(s"Key format detected: ${detectKeyFormat(str)}")
+              case _          => IO.unit
+            }
+            privateKey <- (for {
+              str <- EitherT.fromEither[IO](keyString)
+              pk <- parsePrivateKey(path, str)
+            } yield pk).value
+          } yield privateKey
+      }
+    } yield result
 
   private def detectKeyFormat(keyString: String): String =
     if keyString.contains("BEGIN OPENSSH PRIVATE KEY") then "OpenSSH"

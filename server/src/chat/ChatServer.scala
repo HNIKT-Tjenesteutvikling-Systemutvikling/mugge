@@ -11,8 +11,14 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.io.IOException
 import scala.concurrent.duration.*
+import org.typelevel.log4cats.LoggerFactory
+import org.typelevel.log4cats.slf4j.Slf4jFactory
+import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.{Logger => TLogger}
 
 object ChatServer extends IOApp:
+  given LoggerFactory[IO] = Slf4jFactory.create[IO]
+  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
 
   private val port = port"5555"
   private val host = host"0.0.0.0"
@@ -21,7 +27,7 @@ object ChatServer extends IOApp:
 
   def run(args: List[String]): IO[ExitCode] =
     for
-      _ <- IO.println(s"Starting chat server on $host:$port")
+      _ <- logger.info(s"Starting chat server on $host:$port")
       clients <- Ref.of[IO, Map[String, Client]](Map.empty)
       keyCache <- Ref.of[IO, KeyCache](Map.empty)
       challenges <- Ref.of[IO, Map[String, (String, String)]](
@@ -32,7 +38,7 @@ object ChatServer extends IOApp:
         .flatMap { clientSocket =>
           Stream.eval(
             handleClient(clientSocket, clients, keyCache, challenges)
-              .handleErrorWith(err => IO.println(s"Client error: ${err.getMessage}"))
+              .handleErrorWith(err => logger.error(s"Client error: ${err.getMessage}"))
           )
         }
         .compile
@@ -61,7 +67,7 @@ object ChatServer extends IOApp:
         case Some(authLine) =>
           val githubUsername = authLine.drop(10).trim
           for
-            _ <- IO.println(s"Client $clientId attempting auto-auth as $githubUsername")
+            _ <- logger.debug(s"Client $clientId attempting auto-auth as $githubUsername")
             challenge <- Authentication.generateChallenge().flatMap(IO.fromEither)
             _ <- challenges.update(_ + (clientId -> (challenge, githubUsername)))
             _ <- socket.write(Chunk.from(s"CHALLENGE:$challenge\n".getBytes))
@@ -82,7 +88,7 @@ object ChatServer extends IOApp:
 
       client = Client(clientId, queue, socket, authenticated, autoAuthData.map(_.drop(10).trim))
       _ <- clients.update(_ + (clientId -> client))
-      _ <- IO.println(s"Client $clientId connected (authenticated: $authenticated)")
+      _ <- logger.debug(s"Client $clientId connected (authenticated: $authenticated)")
 
       welcomeMsg =
         if authenticated then
@@ -139,8 +145,8 @@ object ChatServer extends IOApp:
       verified = results.exists(identity)
       _ <-
         if verified then
-          IO.println(s"Successfully verified signature for $clientId as $githubUsername")
-        else IO.println(s"Failed to verify signature for $clientId as $githubUsername")
+          logger.debug(s"Successfully verified signature for $clientId as $githubUsername")
+        else logger.error(s"Failed to verify signature for $clientId as $githubUsername")
     yield verified
 
   private def readFromClient(
@@ -183,7 +189,7 @@ object ChatServer extends IOApp:
       sendToClient(client, s"User $githubUsername is not authorized to use this chat.")
     else
       for
-        _ <- IO.println(s"${client.id} attempting to authenticate as $githubUsername")
+        _ <- logger.debug(s"${client.id} attempting to authenticate as $githubUsername")
         keys <- getCachedKeys(githubUsername, keyCache)
         _ <-
           if keys.isEmpty then
@@ -254,13 +260,13 @@ object ChatServer extends IOApp:
           IO.pure(keys)
         case _ =>
           for
-            _ <- IO.println(s"Fetching SSH keys for $githubUsername from GitHub")
+            _ <- logger.debug(s"Fetching SSH keys for $githubUsername from GitHub")
             freshKeys <- Authentication
               .fetchGithubKeys(githubUsername)
               .flatMap(IO.fromEither)
-              .handleError { err =>
-                println(s"Error fetching keys: ${err.getMessage}")
-                List.empty[Authentication.PublicKeyInfo]
+              .handleErrorWith { err =>
+                logger.error(s"Error fetching keys: ${err.getMessage}") *>
+                  IO.pure(List.empty[Authentication.PublicKeyInfo])
               }
             _ <- keyCache.update(_ + (githubUsername -> (freshKeys, now)))
           yield freshKeys

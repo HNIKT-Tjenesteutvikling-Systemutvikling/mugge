@@ -12,6 +12,8 @@ projects:
       - com.comcast::ip4s-core:3.4.0
       - com.softwaremill.sttp.client3::core:3.9.1
       - com.softwaremill.sttp.client3::cats:3.9.1
+      - ch.qos.logback:logback-classic:1.4.11
+      - org.typelevel::log4cats-slf4j:2.7.0
     extends:
       - template-common-main
       - template-jvm
@@ -28,6 +30,7 @@ projects:
       - com.comcast::ip4s-core:3.4.0
       - org.typelevel::log4cats-slf4j:2.6.0
       - ch.qos.logback:logback-classic:1.4.11
+      - org.typelevel::log4cats-slf4j:2.7.0
     dependsOn: shared
     extends:
       - template-common-main
@@ -45,6 +48,8 @@ projects:
       - co.fs2::fs2-core:3.9.3
       - co.fs2::fs2-io:3.9.3
       - com.comcast::ip4s-core:3.4.0
+      - org.typelevel::log4cats-slf4j:2.7.0
+      - ch.qos.logback:logback-classic:1.5.18
     dependsOn: shared
     extends:
       - template-common-main

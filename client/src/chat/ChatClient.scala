@@ -10,8 +10,14 @@ import java.io.IOException
 import scala.sys.process.*
 import scala.concurrent.duration.*
 import java.security.*
+import org.typelevel.log4cats.LoggerFactory
+import org.typelevel.log4cats.slf4j.Slf4jFactory
+import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.{Logger => TLogger}
 
 object ChatClient extends IOApp:
+  given LoggerFactory[IO] = Slf4jFactory.create[IO]
+  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
 
   private val serverPort = port"5555"
   private val serverHost = host"localhost"
@@ -30,14 +36,14 @@ object ChatClient extends IOApp:
       myUsername <- getUsername
       githubUsername <- Authentication.detectGithubUsername().flatMap(IO.fromEither)
       _ <- githubUsername match
-        case Some(ghu) => IO.println(s"Detected GitHub username: $ghu")
-        case None      => IO.println("Could not detect GitHub username from git config")
+        case Some(ghu) => logger.debug(s"Detected GitHub username: $ghu")
+        case None      => logger.error("Could not detect GitHub username from git config")
 
       exitCode <- Network[IO]
         .client(SocketAddress(host, port))
         .use { socket =>
           for
-            _ <- IO.println(s"Connecting to chat server at $host:$port...")
+            _ <- logger.info(s"Connecting to chat server at $host:$port...")
             state <- Ref.of[IO, ClientState](
               ClientState(
                 githubUsername = githubUsername
@@ -48,9 +54,9 @@ object ChatClient extends IOApp:
         }
         .handleErrorWith {
           case _: IOException =>
-            IO.println(s"Failed to connect to server at $host:$port") *> IO(ExitCode.Error)
+            logger.error(s"Failed to connect to server at $host:$port") *> IO(ExitCode.Error)
           case err =>
-            IO.println(s"Error: ${err.getMessage}") *> IO(ExitCode.Error)
+            logger.error(s"Error: ${err.getMessage}") *> IO(ExitCode.Error)
         }
     yield exitCode
 
@@ -80,9 +86,8 @@ object ChatClient extends IOApp:
           Authentication
             .loadPrivateKey()
             .map(_.toOption)
-            .handleError { err =>
-              println(s"Could not load SSH private key: ${err.getMessage}")
-              None
+            .handleErrorWith { err =>
+              logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
             }
         case None => IO.pure(None)
 
@@ -113,7 +118,7 @@ object ChatClient extends IOApp:
       val serverWriter = writeToServer(socket, outgoingQueue)
 
       serverReader.both(userReader).both(serverWriter).void.handleErrorWith { err =>
-        IO.println(s"\nConnection error: ${err.getMessage}")
+        logger.error(s"\nConnection error: ${err.getMessage}")
       }
     }
 
@@ -134,7 +139,7 @@ object ChatClient extends IOApp:
         else if msg.contains("Authentication successful!") then
           state.update(_.copy(authenticated = true)) >>
             IO.println(s"\r$msg") >>
-            IO.println("You can now start chatting!")
+            logger.info("You can now start chatting!")
         else
           for
             _ <- IO.println(s"\r$msg")
@@ -155,7 +160,7 @@ object ChatClient extends IOApp:
       _ <- (currentState.privateKey, currentState.githubUsername) match
         case (Some(privateKey), Some(githubUsername)) =>
           for
-            _ <- IO.println(s"Received auto-auth challenge, signing...")
+            _ <- logger.debug(s"Received auto-auth challenge, signing...")
             signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
             _ <- Stream
               .emit(s"SIGNATURE:$signature\n")
@@ -163,10 +168,10 @@ object ChatClient extends IOApp:
               .through(socket.writes)
               .compile
               .drain
-            _ <- IO.println(s"Auto-authentication response sent for $githubUsername")
+            _ <- logger.debug(s"Auto-authentication response sent for $githubUsername")
           yield ()
         case _ =>
-          IO.println("Cannot auto-authenticate: missing private key or GitHub username")
+          logger.debug("Cannot auto-authenticate: missing private key or GitHub username")
     yield ()
 
   private def handleManualChallenge(
@@ -179,12 +184,12 @@ object ChatClient extends IOApp:
       _ <- currentState.privateKey match
         case Some(privateKey) =>
           for
-            _ <- IO.println(s"Received authentication challenge, auto-signing...")
+            _ <- logger.debug(s"Received authentication challenge, auto-signing...")
             signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
             _ <- outgoingQueue.offer(s"/verify $signature")
           yield ()
         case None =>
-          IO.println("Cannot sign challenge: SSH private key not loaded")
+          logger.error("Cannot sign challenge: SSH private key not loaded")
     yield ()
 
   private def readFromUser(outgoingQueue: Queue[IO, String]): IO[Unit] =
@@ -259,25 +264,23 @@ object ChatClient extends IOApp:
       body: String,
       urgency: String = "normal",
       timeout: Int = 5000
-  ): IO[Unit] =
-    IO.blocking {
-      try
-        val command = Seq(
-          "notify-send",
-          "-u",
-          urgency,
-          "-i",
-          "dialog-information",
-          "-a",
-          "Terminal Chat",
-          "-t",
-          timeout.toString,
-          title,
-          body
-        )
-        val _ = command.!
-      catch
-        case e: Exception =>
-          println(s"[Notification Error] ${e.getMessage}")
-          println(s"[Notification] $title: $body")
-    }.void
+  ): IO[Unit] = {
+    val command = Seq(
+      "notify-send",
+      "-u",
+      urgency,
+      "-i",
+      "dialog-information",
+      "-a",
+      "Terminal Chat",
+      "-t",
+      timeout.toString,
+      title,
+      body
+    )
+
+    IO.blocking(command.!).void.handleErrorWith { e =>
+      logger.error(s"[Notification Error] ${e.getMessage}") *>
+        logger.info(s"[Notification] $title: $body")
+    }
+  }
