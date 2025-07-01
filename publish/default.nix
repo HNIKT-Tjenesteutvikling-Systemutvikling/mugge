@@ -1,14 +1,13 @@
-{
-  pkgs,
-  src,
-  customJava,
-  bleep,
-  ...
+{ pkgs
+, src
+, customJava
+, bleep
+, ...
 }:
 rec {
   bleepDepsCache = pkgs.stdenv.mkDerivation {
     name = "bleep-deps-cache";
-    src = src;
+    inherit src;
 
     nativeBuildInputs = [
       bleep
@@ -38,7 +37,7 @@ rec {
 
   clientBuild = pkgs.stdenv.mkDerivation {
     name = "mugge-chat-client";
-    src = src;
+    inherit src;
 
     nativeBuildInputs = [
       bleep
@@ -103,7 +102,7 @@ rec {
 
   serverBuild = pkgs.stdenv.mkDerivation {
     name = "mugge-chat-server";
-    src = src;
+    inherit src;
 
     nativeBuildInputs = [
       bleep

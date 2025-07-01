@@ -6,22 +6,21 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
     bleepSrc.url = "github:KristianAN/bleep-flake";
     kvalreg-dev-env.url = "github:HNIKT-Tjenesteutvikling-Systemutvikling/kvalreg-dev-env";
+    pre-commit-hooks-nix.url = "github:cachix/git-hooks.nix";
   };
 
   outputs =
     inputs:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
-      systems = [
-        "x86_64-linux"
-        "x86_64-apple-darwin"
-        "aarch64-apple-darwin"
-      ];
+      systems = [ "x86_64-linux" ];
 
       perSystem =
         { pkgs, system, ... }:
         let
-          bleep = inputs.bleepSrc.defaultPackage.${"x86_64-linux"};
+          bleep = inputs.bleepSrc.defaultPackage.${system};
           customJava = inputs.kvalreg-dev-env.packages.${system}.java;
+          pre-commit-lib = inputs.pre-commit-hooks-nix.lib.${system};
+
           commonInputs = [
             pkgs.maven
             pkgs.libnotify
@@ -68,23 +67,44 @@
                 echo ""
               '';
           };
+
           packages = {
             docker = publishConfig.dockerImage;
             client = publishConfig.clientBuild;
             default = publishConfig.clientBuild;
           };
+
           apps = {
             client = {
               type = "app";
               program = "${publishConfig.clientBuild}/bin/mugge-client";
+              meta.description = "Mugge chat client application";
             };
             server = {
               type = "app";
               program = "${publishConfig.serverBuild}/bin/server";
+              meta.description = "Mugge chat server application";
             };
             default = {
               type = "app";
               program = "${publishConfig.clientBuild}/bin/mugge-client";
+              meta.description = "Mugge chat client application (default)";
+            };
+          };
+
+          formatter = pkgs.nixfmt-rfc-style;
+
+          checks = {
+            pre-commit-check = pre-commit-lib.run {
+              src = ./.;
+              hooks = {
+                statix.enable = true;
+                deadnix.enable = true;
+                nil.enable = true;
+                nixpkgs-fmt.enable = true;
+                shellcheck.enable = true;
+                beautysh.enable = true;
+              };
             };
           };
         };
