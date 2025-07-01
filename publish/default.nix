@@ -24,7 +24,7 @@ rec {
       export IVY_HOME=$out/.ivy2
       export BLEEP_HOME=$out/.bleep
 
-      ${bleep}/bin/bleep compile server shared
+      ${bleep}/bin/bleep compile server shared client
     '';
 
     installPhase = ''
@@ -34,6 +34,71 @@ rec {
     outputHashMode = "recursive";
     outputHash = "sha256-sBzzPEbqDaXtzoL+bcu2Uqcfo13d37lOIYGW6+7vzkw=";
     outputHashAlgo = "sha256";
+  };
+
+  clientBuild = pkgs.stdenv.mkDerivation {
+    name = "mugge-chat-client";
+    src = src;
+
+    nativeBuildInputs = [
+      bleep
+      customJava
+      pkgs.coursier
+      pkgs.scala-cli
+    ];
+
+    buildPhase = ''
+      export JAVA_HOME=${customJava}
+
+      export COURSIER_CACHE=$PWD/.coursier
+      export IVY_HOME=$PWD/.ivy2
+      export BLEEP_HOME=$PWD/.bleep
+
+      cp -r ${bleepDepsCache}/.coursier $PWD/ 2>/dev/null || true
+      cp -r ${bleepDepsCache}/.ivy2 $PWD/ 2>/dev/null || true
+      cp -r ${bleepDepsCache}/.bleep $PWD/ 2>/dev/null || true
+
+      echo "Building mugge chat client distribution..."
+      ${bleep}/bin/bleep dist client
+
+      DIST_DIR=".bleep/builds/normal/.bloop/client/dist"
+
+      echo "Distribution contents:"
+      ls -la "$DIST_DIR"
+      ls -la "$DIST_DIR/bin" || true
+      ls -la "$DIST_DIR/lib" || true
+    '';
+
+    installPhase = ''
+      mkdir -p $out
+
+      DIST_DIR=".bleep/builds/normal/.bloop/client/dist"
+      cp -r "$DIST_DIR"/* $out/
+
+      if [ ! -f "$out/bin/client" ]; then
+        mkdir -p $out/bin
+        cat > $out/bin/mugge-client << 'EOF'
+      #!/usr/bin/env bash
+      export JAVA_HOME=${customJava}
+
+      CLASSPATH=""
+      for jar in $out/lib/*.jar; do
+        CLASSPATH="$CLASSPATH:$jar"
+      done
+      CLASSPATH=''${CLASSPATH#:}  
+
+      exec ${customJava}/bin/java -cp "$CLASSPATH" chat.ChatClient "$@"
+      EOF
+        chmod +x $out/bin/mugge-client
+      else
+        substituteInPlace $out/bin/client \
+          --replace "#!/bin/sh" "#!${pkgs.bash}/bin/bash" \
+          --replace "java" "${customJava}/bin/java" || true
+        chmod +x $out/bin/client
+        
+        ln -s $out/bin/client $out/bin/mugge-client
+      fi
+    '';
   };
 
   serverBuild = pkgs.stdenv.mkDerivation {
@@ -96,12 +161,9 @@ rec {
       ]
     }:$PATH
 
-    export SERVER_PORT="''${SERVER_PORT:-9999}"
-    export LOG_LEVEL="''${LOG_LEVEL:-INFO}"
-
     echo "Server configuration:"
-    echo "  Port: $SERVER_PORT"
-    echo "  Log level: $LOG_LEVEL"
+    echo "  Listening on port: 5555"
+    echo "  Log level: ''${LOG_LEVEL:-INFO}"
     echo "  Java: ${customJava}"
 
     JVM_OPTS="''${JVM_OPTS:--Xmx512m -Xms256m}"
@@ -144,7 +206,7 @@ rec {
     config = {
       Cmd = [ "${startupScript}" ];
       ExposedPorts = {
-        "9999/tcp" = { };
+        "5555/tcp" = { };
       };
       WorkingDir = "/home/mugge";
       User = "mugge";
@@ -158,7 +220,6 @@ rec {
             pkgs.procps
           ]
         }"
-        "SERVER_PORT=9999"
         "LOG_LEVEL=INFO"
         "JVM_OPTS=-Xmx512m -Xms256m"
       ];

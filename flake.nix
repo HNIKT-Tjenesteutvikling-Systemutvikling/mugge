@@ -60,7 +60,9 @@
               + ''
                 echo "Available commands:"
                 echo ""
-                echo "  nix build .#docker                                     - Build the Docker image"
+                echo "  nix build .#client                                     - Build the Client"
+                echo "  nix run .#client                                       - Run the Client"
+                echo "  nix build .#docker                                     - Build the Docker image for server"
                 echo "  docker load < result                                   - Load the built image into Docker"
                 echo "  docker run -p 5555:5555 mugge-chat-server:latest       - Run container with nginx"
                 echo ""
@@ -68,6 +70,22 @@
           };
           packages = {
             docker = publishConfig.dockerImage;
+            client = publishConfig.clientBuild;
+            default = publishConfig.clientBuild;
+          };
+          apps = {
+            client = {
+              type = "app";
+              program = "${publishConfig.clientBuild}/bin/mugge-client";
+            };
+            server = {
+              type = "app";
+              program = "${publishConfig.serverBuild}/bin/server";
+            };
+            default = {
+              type = "app";
+              program = "${publishConfig.clientBuild}/bin/mugge-client";
+            };
           };
         };
     };
