@@ -39,12 +39,35 @@
           jvmHook = ''
             JAVA_HOME="${customJava}"
           '';
+
+          publishConfig = import ./publish/default.nix {
+            inherit
+              pkgs
+              system
+              customJava
+              bleep
+              ;
+            src = ./.;
+          };
         in
         {
           devShells.default = pkgs.mkShell {
             name = "Mugge Chat APP dev";
             buildInputs = commonInputs ++ jvmInputs;
-            shellHook = jvmHook;
+            shellHook =
+              jvmHook
+              + "\n"
+              + ''
+                echo "Available commands:"
+                echo ""
+                echo "  nix build .#docker                                     - Build the Docker image"
+                echo "  docker load < result                                   - Load the built image into Docker"
+                echo "  docker run -p 5555:5555 mugge-chat-server:latest       - Run container with nginx"
+                echo ""
+              '';
+          };
+          packages = {
+            docker = publishConfig.dockerImage;
           };
         };
     };
