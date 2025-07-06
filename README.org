@@ -18,12 +18,6 @@ To compile the code, run:
 bleep compile
 #+end_src
 
-** Running the server
-
-#+begin_src shell
-bleep run server
-#+end_src
-
 ** Running the client
 
 #+begin_src shell
@@ -33,6 +27,5 @@ bleep run client
 * Project Structure
 
 The project is divided into three main parts:
-- =server=: Contains the server-side logic of the chat application.
 - =client=: Contains the client-side logic for connecting to the chat server.
 - =shared=: Contains the common code shared between the server and the client, such as message formats and network protocols.

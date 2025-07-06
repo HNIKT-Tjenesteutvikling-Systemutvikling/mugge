@@ -24,7 +24,6 @@
             pkgs.maven
             pkgs.libnotify
             pkgs.openssl
-            pkgs.pulumi-bin
           ];
 
           jvmInputs = with pkgs; [
@@ -35,26 +34,9 @@
             bleep
           ];
 
-          toolInputs = with pkgs; [
-            publishDocker
-            publishInfra
-            azure-cli
-            azureLogs
-            azureEnv
-            libxml2
-          ];
-
           jvmHook = ''
             JAVA_HOME="${customJava}"
           '';
-
-          pulumiHook = ''
-            pulumi plugin install language scala 0.3.2 --server github://api.github.com/VirtusLab/besom
-          '';
-
-          utilsConfig = import ./utils/default.nix {
-            inherit pkgs system;
-          };
 
           publishConfig = import ./publish/default.nix {
             inherit
@@ -66,35 +48,24 @@
             src = ./.;
           };
 
-          inherit (utilsConfig)
-            publishDocker
-            publishInfra
-            azureLogs
-            azureEnv
-            ;
         in
         {
           devShells.default = pkgs.mkShell {
             name = "Mugge Chat APP dev";
-            buildInputs = commonInputs ++ jvmInputs ++ toolInputs;
+            buildInputs = commonInputs ++ jvmInputs;
             shellHook =
               jvmHook
-              + pulumiHook
               + "\n"
               + ''
                 echo "Available commands:"
                 echo ""
                 echo "  nix build .#client                                     - Build the Client"
                 echo "  nix run .#client                                       - Run the Client"
-                echo "  nix build .#docker                                     - Build the Docker image for server"
-                echo "  docker load < result                                   - Load the built image into Docker"
-                echo "  docker run -p 5555:5555 mugge-chat-server:latest       - Run container with nginx"
                 echo ""
               '';
           };
 
           packages = {
-            docker = publishConfig.dockerImage;
             client = publishConfig.clientBuild;
             default = publishConfig.clientBuild;
           };
@@ -104,11 +75,6 @@
               type = "app";
               program = "${publishConfig.clientBuild}/bin/mugge-client";
               meta.description = "Mugge chat client application";
-            };
-            server = {
-              type = "app";
-              program = "${publishConfig.serverBuild}/bin/server";
-              meta.description = "Mugge chat server application";
             };
             default = {
               type = "app";

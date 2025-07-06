@@ -1,8 +1,0 @@
-encryptionsalt: v1:v74qDAgHWfs=:v1:8xeJ4z1zDx3iPd25:EyOYoowEp49U6PSe039Qiexfk+xJew==
-config:
-  mugge-chat:DOCKER_REGISTRY_SERVER_USERNAME:
-    secure: v1:plF3s4jVmSpsKjRo:HuQ6Z1R2FCQNrNc8Ka+3sXwTgvlIrPz3GDQ=
-  mugge-chat:DOCKER_REGISTRY_SERVER_URL:
-    secure: v1:sjD1NpYr8IQkI50U:ceswqXBembBmOPwZFx40H+iReAfEBorGexJ81WsiEw==
-  mugge-chat:DOCKER_REGISTRY_SERVER_PASSWORD:
-    secure: v1:/n0u6tLm3UIQdGCU:ngib4e/nfoRThRu+r4kIoxVWyRDXp8OocoWp4OLqo/eIb+gPeQNR2owGev/4xYbV4yz4odSEBao=
