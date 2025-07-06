@@ -6,3 +6,7 @@ hs_err_pid*
 
 .direnv/
 result
+
+build/
+
+.scala-build/

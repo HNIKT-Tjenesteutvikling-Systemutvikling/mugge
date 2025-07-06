@@ -1,0 +1,71 @@
+# This workflow builds the project using Nix flakes.
+# This allows us to use the same flake that is defined for the build.
+# Any custom build step is defined in the flake using writeScriptBin
+
+name: Scala CI with Nix flake
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: ["master"]
+
+permissions:
+  contents: write
+  packages: write
+  issues: read
+  checks: write
+  pull-requests: write
+
+env:
+  MVN_USER: ${{ github.actor }}
+  MVN_PCKGS: ${{ secrets.MVN_PCKGS }}
+
+jobs:
+  matrix:
+    name: Check File Changes
+    runs-on: ubuntu-latest
+    outputs:
+      scala_changed: ${{ steps.filter.outputs.scala_changed }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Check for file changes
+        id: filter
+        run: |
+          # Get only the most recent commit
+          LATEST_COMMIT=$(git rev-parse HEAD)
+          PREVIOUS_COMMIT=$(git rev-parse HEAD~1 || echo "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+
+          CHANGED_FILES=$(git diff --name-only $PREVIOUS_COMMIT $LATEST_COMMIT)
+
+          echo "Files changed in the most recent commit:"
+          echo "$CHANGED_FILES"
+
+          if echo "$CHANGED_FILES" | grep -q -e "\.scala$" -e "bleep\.yaml" -e "flake\.nix"; then
+            echo "Scala or build files changed in the last commit"
+            echo "scala_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No Scala files changed in the last commit"
+            echo "scala_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  ScalaPipeline:
+    runs-on: ubuntu-latest
+    needs: matrix
+    if: needs.matrix.outputs.scala_changed == 'true'
+    steps:
+      - uses: actions/checkout@v3
+      - uses: cachix/install-nix-action@v22
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: scalafmt check
+        run: nix develop --command scalafmt --check
+
+      - name: nix flake check
+        run: nix develop --command nix flake check
+

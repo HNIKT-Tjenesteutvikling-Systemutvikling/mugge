@@ -13,7 +13,6 @@
     inputs:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" ];
-
       perSystem =
         { pkgs, system, ... }:
         let
@@ -25,6 +24,7 @@
             pkgs.maven
             pkgs.libnotify
             pkgs.openssl
+            pkgs.pulumi-bin
           ];
 
           jvmInputs = with pkgs; [
@@ -35,9 +35,26 @@
             bleep
           ];
 
+          toolInputs = with pkgs; [
+            publishDocker
+            publishInfra
+            azure-cli
+            azureLogs
+            azureEnv
+            libxml2
+          ];
+
           jvmHook = ''
             JAVA_HOME="${customJava}"
           '';
+
+          pulumiHook = ''
+            pulumi plugin install language scala 0.3.2 --server github://api.github.com/VirtusLab/besom
+          '';
+
+          utilsConfig = import ./utils/default.nix {
+            inherit pkgs system;
+          };
 
           publishConfig = import ./publish/default.nix {
             inherit
@@ -48,13 +65,21 @@
               ;
             src = ./.;
           };
+
+          inherit (utilsConfig)
+            publishDocker
+            publishInfra
+            azureLogs
+            azureEnv
+            ;
         in
         {
           devShells.default = pkgs.mkShell {
             name = "Mugge Chat APP dev";
-            buildInputs = commonInputs ++ jvmInputs;
+            buildInputs = commonInputs ++ jvmInputs ++ toolInputs;
             shellHook =
               jvmHook
+              + pulumiHook
               + "\n"
               + ''
                 echo "Available commands:"

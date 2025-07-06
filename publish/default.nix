@@ -205,7 +205,7 @@ rec {
     config = {
       Cmd = [ "${startupScript}" ];
       ExposedPorts = {
-        "5555/tcp" = { };
+        "8080/tcp" = { };
       };
       WorkingDir = "/home/mugge";
       User = "mugge";

@@ -20,7 +20,7 @@ object ChatServer extends IOApp:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]
   given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
 
-  private val port = port"5555"
+  private val port = sys.env.get("PORT").flatMap(p => Port.fromString(p)).getOrElse(port"5555")
   private val host = host"0.0.0.0"
 
   private type KeyCache = Map[String, (List[Authentication.PublicKeyInfo], Long)]
