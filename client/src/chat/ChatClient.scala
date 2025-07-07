@@ -19,8 +19,8 @@ object ChatClient extends IOApp:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]
   given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
 
-  private val serverPort = port"5555"
-  private val serverHost = host"localhost"
+  private val defaultPort = port"5555"
+  private val defaultHost = host"localhost"
 
   case class ClientState(
       authenticated: Boolean = false,
@@ -29,10 +29,20 @@ object ChatClient extends IOApp:
   )
 
   def run(args: List[String]): IO[ExitCode] =
-    val host = args.headOption.map(Host.fromString).flatten.getOrElse(serverHost)
-    val port = args.lift(1).flatMap(Port.fromString).getOrElse(serverPort)
+    val host = args.headOption
+      .flatMap(Host.fromString)
+      .orElse(sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString))
+      .getOrElse(defaultHost)
+
+    val port = args
+      .lift(1)
+      .flatMap(Port.fromString)
+      .orElse(sys.env.get("CHAT_SERVER_PORT").flatMap(Port.fromString))
+      .getOrElse(defaultPort)
 
     for
+      _ <- logger.info(s"Mugge Chat Client starting...")
+      _ <- logger.info(s"Server: $host:$port")
       myUsername <- getUsername
       githubUsername <- Authentication.detectGithubUsername().flatMap(IO.fromEither)
       _ <- githubUsername match
@@ -43,7 +53,7 @@ object ChatClient extends IOApp:
         .client(SocketAddress(host, port))
         .use { socket =>
           for
-            _ <- logger.info(s"Connecting to chat server at $host:$port...")
+            _ <- logger.info(s"Connected to chat server at $host:$port!")
             state <- Ref.of[IO, ClientState](
               ClientState(
                 githubUsername = githubUsername

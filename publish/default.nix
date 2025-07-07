@@ -1,8 +1,9 @@
-{ pkgs
-, src
-, customJava
-, bleep
-, ...
+{
+  pkgs,
+  src,
+  customJava,
+  bleep,
+  ...
 }:
 rec {
   bleepDepsCache = pkgs.stdenv.mkDerivation {
@@ -22,8 +23,12 @@ rec {
       export COURSIER_CACHE=$out/.coursier
       export IVY_HOME=$out/.ivy2
       export BLEEP_HOME=$out/.bleep
+      export BLEEP_SERVER_START_TIMEOUT=300
+      export BLOOP_COMPUTATION_TIMEOUT=300
+      export JAVA_OPTS="-Xmx2G -Xms512M"
+      export COURSIER_PARALLEL_DOWNLOAD_COUNT=4
 
-      ${bleep}/bin/bleep compile server shared client
+      ${bleep}/bin/bleep compile shared client
     '';
 
     installPhase = ''
@@ -100,128 +105,65 @@ rec {
     '';
   };
 
-  serverBuild = pkgs.stdenv.mkDerivation {
-    name = "mugge-chat-server";
-    inherit src;
+  muggeClient = pkgs.writeShellScriptBin "mugge" ''
+    #!${pkgs.bash}/bin/bash
 
-    nativeBuildInputs = [
-      bleep
-      customJava
-      pkgs.coursier
-      pkgs.scala-cli
-    ];
+    GREEN='\033[0;32m'
+    BLUE='\033[0;34m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m' # No Color
 
-    buildPhase = ''
-      export JAVA_HOME=${customJava}
+    echo -e "''${BLUE}╔════════════════════════════════════╗''${NC}"
+    echo -e "''${BLUE}║      Mugge Chat Client v1.0        ║''${NC}"
+    echo -e "''${BLUE}╚════════════════════════════════════╝''${NC}"
+    echo
 
-      export COURSIER_CACHE=$PWD/.coursier
-      export IVY_HOME=$PWD/.ivy2
-      export BLEEP_HOME=$PWD/.bleep
-
-      cp -r ${bleepDepsCache}/.coursier $PWD/ 2>/dev/null || true
-      cp -r ${bleepDepsCache}/.ivy2 $PWD/ 2>/dev/null || true
-      cp -r ${bleepDepsCache}/.bleep $PWD/ 2>/dev/null || true
-
-      echo "Building mugge chat server distribution..."
-      ${bleep}/bin/bleep dist server
-
-      DIST_DIR=".bleep/builds/normal/.bloop/server/dist"
-
-      echo "Distribution contents:"
-      ls -la "$DIST_DIR"
-      ls -la "$DIST_DIR/bin"
-      ls -la "$DIST_DIR/lib"
-    '';
-
-    installPhase = ''
-      mkdir -p $out
-
-      DIST_DIR=".bleep/builds/normal/.bloop/server/dist"
-      cp -r "$DIST_DIR"/* $out/
-
-      substituteInPlace $out/bin/server \
-        --replace "#!/bin/sh" "#!${pkgs.bash}/bin/bash" \
-        --replace "java" "${customJava}/bin/java" || true
-
-      chmod +x $out/bin/server
-    '';
-  };
-
-  startupScript = pkgs.writeShellScript "start-server" ''
-    set -e
-
-    echo "Starting Mugge Chat Server..."
-    export JAVA_HOME=${customJava}
-    export PATH=${
-      pkgs.lib.makeBinPath [
-        customJava
-        pkgs.coreutils
-        pkgs.bash
-      ]
-    }:$PATH
-
-    echo "Server configuration:"
-    echo "  Listening on port: 5555"
-    echo "  Log level: ''${LOG_LEVEL:-INFO}"
-    echo "  Java: ${customJava}"
-
-    JVM_OPTS="''${JVM_OPTS:--Xmx512m -Xms256m}"
-    echo "  JVM Options: $JVM_OPTS"
-
-    export JAVA_OPTS="$JVM_OPTS"
-    exec ${serverBuild}/bin/server
+    if [ $# -gt 0 ]; then
+      exec ${clientBuild}/bin/mugge-client "$@"
+    else
+      HOST=''${CHAT_SERVER_HOST:-localhost}
+      PORT=''${CHAT_SERVER_PORT:-5555}
+      
+      echo -e "''${YELLOW}Connecting to: ''${HOST}:''${PORT}''${NC}"
+      echo -e "''${GREEN}Tip: Set CHAT_SERVER_HOST and CHAT_SERVER_PORT to change defaults''${NC}"
+      echo
+      
+      exec ${clientBuild}/bin/mugge-client "$HOST" "$PORT"
+    fi
   '';
 
-  appEnv = pkgs.buildEnv {
-    name = "mugge-server-env";
-    paths = with pkgs; [
-      customJava
-      coreutils
-      bash
-      procps
-      serverBuild
-    ];
-  };
+  muggeAzure = pkgs.writeShellScriptBin "mugge-azure" ''
+    #!${pkgs.bash}/bin/bash
 
-  dockerImage = pkgs.dockerTools.buildImage {
-    name = "mugge-chat-server";
-    tag = "latest";
+    AZURE_HOST="mugge-chat-server.norwayeast.azurecontainer.io"
+    AZURE_PORT="5555"
 
-    copyToRoot = appEnv;
+    echo "🌐 Connecting to Azure Container Instance..."
+    echo "   Server: $AZURE_HOST:$AZURE_PORT"
+    echo
 
-    runAsRoot = ''
-      #!${pkgs.runtimeShell}
-      ${pkgs.dockerTools.shadowSetup}
+    export CHAT_SERVER_HOST="$AZURE_HOST"
+    export CHAT_SERVER_PORT="$AZURE_PORT"
 
-      groupadd -r mugge || true
-      useradd -r -g mugge -d /home/mugge -s /bin/false mugge || true
+    exec ${muggeClient}/bin/mugge
+  '';
 
-      mkdir -p /var/log/mugge /home/mugge
-      chown -R mugge:mugge /var/log/mugge /home/mugge
+  muggeDev = pkgs.writeShellScriptBin "mugge-dev" ''
+    #!${pkgs.bash}/bin/bash
 
-      chmod 1777 /tmp
-    '';
+    if [ -z "$1" ]; then
+      echo "Usage: mugge-dev <hostname> [port]"
+      echo "Example: mugge-dev dev.example.com 5555"
+      exit 1
+    fi
 
-    config = {
-      Cmd = [ "${startupScript}" ];
-      ExposedPorts = {
-        "8080/tcp" = { };
-      };
-      WorkingDir = "/home/mugge";
-      User = "mugge";
-      Env = [
-        "JAVA_HOME=${customJava}"
-        "PATH=${
-          pkgs.lib.makeBinPath [
-            customJava
-            pkgs.coreutils
-            pkgs.bash
-            pkgs.procps
-          ]
-        }"
-        "LOG_LEVEL=INFO"
-        "JVM_OPTS=-Xmx512m -Xms256m"
-      ];
-    };
-  };
+    HOST="$1"
+    PORT="''${2:-5555}"
+
+    echo "🔧 Connecting to development server..."
+    echo "   Server: $HOST:$PORT"
+    echo
+
+    exec ${muggeClient}/bin/mugge "$HOST" "$PORT"
+  '';
 }

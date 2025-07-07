@@ -59,27 +59,48 @@
               + ''
                 echo "Available commands:"
                 echo ""
-                echo "  nix build .#client                                     - Build the Client"
-                echo "  nix run .#client                                       - Run the Client"
+                echo "  nix build .#client   - Build the Client"
+                echo "  nix build .#azure    - Build the Azure client"
+                echo "  nix run .#client     - Run the Client"
+                echo "  nix run .#azure      - Run the Azure client"
                 echo ""
               '';
           };
 
           packages = {
             client = publishConfig.clientBuild;
-            default = publishConfig.clientBuild;
+            mugge = publishConfig.muggeClient;
+            mugge-azure = publishConfig.muggeAzure;
+            mugge-local = publishConfig.muggeLocal;
+            mugge-dev = publishConfig.muggeDev;
+            default = publishConfig.muggeClient;
           };
 
           apps = {
             client = {
               type = "app";
-              program = "${publishConfig.clientBuild}/bin/mugge-client";
-              meta.description = "Mugge chat client application";
+              program = "${publishConfig.muggeClient}/bin/mugge";
+              meta.description = "Mugge chat client";
+            };
+            azure = {
+              type = "app";
+              program = "${publishConfig.muggeAzure}/bin/mugge-azure";
+              meta.description = "Connect to Azure-hosted Mugge server";
+            };
+            local = {
+              type = "app";
+              program = "${publishConfig.muggeLocal}/bin/mugge-local";
+              meta.description = "Connect to local Mugge server";
+            };
+            dev = {
+              type = "app";
+              program = "${publishConfig.muggeDev}/bin/mugge-dev";
+              meta.description = "Connect to custom development server";
             };
             default = {
               type = "app";
-              program = "${publishConfig.clientBuild}/bin/mugge-client";
-              meta.description = "Mugge chat client application (default)";
+              program = "${publishConfig.muggeAzure}/bin/mugge-azure";
+              meta.description = "Mugge chat client Azure (default)";
             };
           };
 
