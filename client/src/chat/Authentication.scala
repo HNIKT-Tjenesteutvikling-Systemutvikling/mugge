@@ -5,12 +5,8 @@ import cats.syntax.all.*
 import cats.data.EitherT
 import java.security.*
 import java.security.spec.*
-import java.security.interfaces.RSAPrivateCrtKey
 import java.util.Base64
-import sttp.client3.*
-import sttp.client3.httpclient.cats.HttpClientCatsBackend
 import java.nio.file.{Files, Paths, LinkOption}
-import java.math.BigInteger
 import scala.sys.process.*
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
@@ -25,7 +21,6 @@ object Authentication:
     def message: String
     override def getMessage: String = message
 
-  case class KeyFetchError(message: String) extends AuthError
   case class KeyParseError(message: String) extends AuthError
   case class KeyLoadError(message: String) extends AuthError
   case class KeyConversionError(message: String) extends AuthError
@@ -35,125 +30,17 @@ object Authentication:
   enum AuthorizedUser(val githubUsername: String):
     case Gako358 extends AuthorizedUser("Gako358")
     case Merrinx extends AuthorizedUser("merrinx")
+    case Grindstein extends AuthorizedUser("grindstein")
+    case Ievensen extends AuthorizedUser("ievensen")
+    case Neethan extends AuthorizedUser("neethan")
+    case Sigubrat extends AuthorizedUser("sigubrat")
+    case Intervbs extends AuthorizedUser("intervbs")
+    case Jca002 extends AuthorizedUser("jca002")
+    case KristianAN extends AuthorizedUser("KristianAN")
+    case Solheim extends AuthorizedUser("5olheim")
+    case TurboNaepskrel extends AuthorizedUser("TurboNaepskrel")
 
   case class AuthChallenge(challenge: String, signature: Option[String])
-
-  case class PublicKeyInfo(
-      key: PublicKey,
-      fingerprint: String,
-      rawKey: String
-  )
-
-  // Cache timeout: 24 hours (in milliseconds)
-  val CACHE_TIMEOUT_MS: Long = 24 * 60 * 60 * 1000L
-
-  def fetchGithubKeys(username: String): IO[Either[AuthError, List[PublicKeyInfo]]] =
-    HttpClientCatsBackend.resource[IO]().use { backend =>
-      val request = basicRequest
-        .get(uri"https://github.com/$username.keys")
-        .response(asString)
-
-      (for
-        response <- EitherT
-          .liftF[IO, AuthError, Response[Either[String, String]]](backend.send(request))
-        body <- EitherT.fromEither[IO](
-          response.body.leftMap(error => KeyFetchError(s"Failed to fetch keys from GitHub: $error"))
-        )
-        keys <- parseSSHKeys(body)
-      yield keys).value
-    }
-
-  private def parseSSHKeys(keysText: String): EitherT[IO, AuthError, List[PublicKeyInfo]] =
-    EitherT.fromEither[IO] {
-      val lines = keysText
-        .split("\n")
-        .filter(_.trim.nonEmpty)
-        .toList
-
-      lines.traverse { line =>
-        val parts = line.trim.split("\\s+")
-        if parts.length >= 2 && parts(0) == "ssh-rsa" then
-          for
-            keyBytes <- Either
-              .catchNonFatal(Base64.getDecoder.decode(parts(1)))
-              .leftMap(e => KeyParseError(s"Failed to decode base64 for key: ${e.getMessage}"))
-            x509Bytes <- convertSSHtoX509(keyBytes)
-            keySpec = new X509EncodedKeySpec(x509Bytes)
-            keyFactory <- Either
-              .catchNonFatal(KeyFactory.getInstance("RSA"))
-              .leftMap(e => KeyParseError(s"Failed to get RSA key factory: ${e.getMessage}"))
-            publicKey <- Either
-              .catchNonFatal(keyFactory.generatePublic(keySpec))
-              .leftMap(e => KeyParseError(s"Failed to generate public key: ${e.getMessage}"))
-            fingerprint <- calculateFingerprint(keyBytes)
-          yield PublicKeyInfo(publicKey, fingerprint, line)
-        else
-          Left(
-            KeyParseError(
-              s"Invalid SSH key format: expected ssh-rsa, got ${parts.headOption.getOrElse("empty")}"
-            )
-          )
-      }
-    }
-
-  private def convertSSHtoX509(sshKey: Array[Byte]): Either[AuthError, Array[Byte]] =
-    Either
-      .catchNonFatal {
-        var offset = 0
-
-        val typeLen = ((sshKey(offset) & 0xff) << 24) |
-          ((sshKey(offset + 1) & 0xff) << 16) |
-          ((sshKey(offset + 2) & 0xff) << 8) |
-          (sshKey(offset + 3) & 0xff)
-        offset += 4 + typeLen
-
-        val expLen = ((sshKey(offset) & 0xff) << 24) |
-          ((sshKey(offset + 1) & 0xff) << 16) |
-          ((sshKey(offset + 2) & 0xff) << 8) |
-          (sshKey(offset + 3) & 0xff)
-        offset += 4
-        val exponent = sshKey.slice(offset, offset + expLen)
-        offset += expLen
-
-        val modLen = ((sshKey(offset) & 0xff) << 24) |
-          ((sshKey(offset + 1) & 0xff) << 16) |
-          ((sshKey(offset + 2) & 0xff) << 8) |
-          (sshKey(offset + 3) & 0xff)
-        offset += 4
-        val modulus = sshKey.slice(offset, offset + modLen)
-
-        val spec = new RSAPublicKeySpec(
-          new java.math.BigInteger(1, modulus),
-          new java.math.BigInteger(1, exponent)
-        )
-        val keyFactory = KeyFactory.getInstance("RSA")
-        val publicKey = keyFactory.generatePublic(spec)
-        publicKey.getEncoded
-      }
-      .leftMap(e => KeyConversionError(s"Failed to convert SSH key to X509: ${e.getMessage}"))
-
-  private def calculateFingerprint(keyBytes: Array[Byte]): Either[AuthError, String] =
-    Either
-      .catchNonFatal {
-        val md = MessageDigest.getInstance("SHA-256")
-        val hash = md.digest(keyBytes)
-        Base64.getEncoder.encodeToString(hash)
-      }
-      .leftMap(e => KeyParseError(s"Failed to calculate fingerprint: ${e.getMessage}"))
-
-  def generateChallenge(): IO[Either[AuthError, String]] =
-    EitherT
-      .fromEither[IO] {
-        Either
-          .catchNonFatal {
-            val random = new SecureRandom()
-            val bytes = new Array[Byte](32)
-            random.nextBytes(bytes)
-            Base64.getEncoder.encodeToString(bytes)
-          }
-          .leftMap(e => SignatureError(s"Failed to generate challenge: ${e.getMessage}"))
-      }
-      .value
 
   def loadPrivateKey(
       keyPath: String = s"${System.getProperty("user.home")}/.ssh/id_rsa"
@@ -323,28 +210,6 @@ object Authentication:
       }
       .leftMap(e => KeyConversionError(s"Failed to convert PKCS1 key: ${e.getMessage}"))
 
-  def getPublicKeyFromPrivate(privateKey: PrivateKey): Either[AuthError, PublicKey] =
-    privateKey match
-      case rsaPrivate: RSAPrivateCrtKey =>
-        Either
-          .catchNonFatal {
-            val spec = new RSAPublicKeySpec(rsaPrivate.getModulus, rsaPrivate.getPublicExponent)
-            val keyFactory = KeyFactory.getInstance("RSA")
-            keyFactory.generatePublic(spec)
-          }
-          .leftMap(e => KeyConversionError(s"Failed to derive public key: ${e.getMessage}"))
-      case _ =>
-        Left(KeyConversionError("Unsupported private key type"))
-
-  def getLocalSSHPublicKey(
-      keyPath: String = s"${System.getProperty("user.home")}/.ssh/id_rsa.pub"
-  ): IO[Either[AuthError, String]] =
-    EitherT(IO.blocking {
-      Either
-        .catchNonFatal(Files.readString(Paths.get(keyPath)).trim)
-        .leftMap(e => KeyLoadError(s"Failed to read public key file: ${e.getMessage}"))
-    }).value
-
   def signChallenge(challenge: String, privateKey: PrivateKey): IO[Either[AuthError, String]] =
     EitherT
       .fromEither[IO] {
@@ -357,24 +222,6 @@ object Authentication:
             Base64.getEncoder.encodeToString(signatureBytes)
           }
           .leftMap(e => SignatureError(s"Failed to sign challenge: ${e.getMessage}"))
-      }
-      .value
-
-  def verifySignature(
-      challenge: String,
-      signature: String,
-      publicKey: PublicKey
-  ): IO[Either[AuthError, Boolean]] =
-    EitherT
-      .fromEither[IO] {
-        Either
-          .catchNonFatal {
-            val sig = Signature.getInstance("SHA256withRSA")
-            sig.initVerify(publicKey)
-            sig.update(challenge.getBytes("UTF-8"))
-            sig.verify(Base64.getDecoder.decode(signature))
-          }
-          .leftMap(e => SignatureError(s"Failed to verify signature: ${e.getMessage}"))
       }
       .value
 

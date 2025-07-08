@@ -15,17 +15,15 @@ This project is a chat application written in Scala 3, using cats-effect for con
 
 To compile the code, run:
 #+begin_src shell
-bleep compile
+  bleep compile
 #+end_src
 
 ** Running the client
 
 #+begin_src shell
-bleep run client
+  bleep run client
 #+end_src
 
-* Project Structure
-
-The project is divided into three main parts:
-- =client=: Contains the client-side logic for connecting to the chat server.
-- =shared=: Contains the common code shared between the server and the client, such as message formats and network protocols.
+#+begin_src nix-ts
+  nix run .#client
+#+end_src

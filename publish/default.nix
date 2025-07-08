@@ -28,7 +28,7 @@ rec {
       export JAVA_OPTS="-Xmx2G -Xms512M"
       export COURSIER_PARALLEL_DOWNLOAD_COUNT=4
 
-      ${bleep}/bin/bleep compile shared client
+      ${bleep}/bin/bleep compile client
     '';
 
     installPhase = ''
@@ -36,7 +36,7 @@ rec {
     '';
 
     outputHashMode = "recursive";
-    outputHash = "sha256-sBzzPEbqDaXtzoL+bcu2Uqcfo13d37lOIYGW6+7vzkw=";
+    outputHash = "sha256-vNaeIRZxGMWnp9i65tN8pzE4Dqg35f7nHtsPlIbjtU0=";
     outputHashAlgo = "sha256";
   };
 
@@ -146,24 +146,5 @@ rec {
     export CHAT_SERVER_PORT="$AZURE_PORT"
 
     exec ${muggeClient}/bin/mugge
-  '';
-
-  muggeDev = pkgs.writeShellScriptBin "mugge-dev" ''
-    #!${pkgs.bash}/bin/bash
-
-    if [ -z "$1" ]; then
-      echo "Usage: mugge-dev <hostname> [port]"
-      echo "Example: mugge-dev dev.example.com 5555"
-      exit 1
-    fi
-
-    HOST="$1"
-    PORT="''${2:-5555}"
-
-    echo "🔧 Connecting to development server..."
-    echo "   Server: $HOST:$PORT"
-    echo
-
-    exec ${muggeClient}/bin/mugge "$HOST" "$PORT"
   '';
 }

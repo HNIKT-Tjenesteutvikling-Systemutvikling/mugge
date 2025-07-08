@@ -71,8 +71,6 @@
             client = publishConfig.clientBuild;
             mugge = publishConfig.muggeClient;
             mugge-azure = publishConfig.muggeAzure;
-            mugge-local = publishConfig.muggeLocal;
-            mugge-dev = publishConfig.muggeDev;
             default = publishConfig.muggeClient;
           };
 
@@ -86,16 +84,6 @@
               type = "app";
               program = "${publishConfig.muggeAzure}/bin/mugge-azure";
               meta.description = "Connect to Azure-hosted Mugge server";
-            };
-            local = {
-              type = "app";
-              program = "${publishConfig.muggeLocal}/bin/mugge-local";
-              meta.description = "Connect to local Mugge server";
-            };
-            dev = {
-              type = "app";
-              program = "${publishConfig.muggeDev}/bin/mugge-dev";
-              meta.description = "Connect to custom development server";
             };
             default = {
               type = "app";
