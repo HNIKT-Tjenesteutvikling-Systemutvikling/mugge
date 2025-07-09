@@ -45,6 +45,7 @@ object ChatClient extends IOApp:
       _ <- logger.info(s"Server: $host:$port")
       myUsername <- getUsername
       githubUsername <- Authentication.detectGithubUsername().flatMap(IO.fromEither)
+      _ <- logger.info(s"The github username is: ${githubUsername}")
       _ <- githubUsername match
         case Some(ghu) => logger.debug(s"Detected GitHub username: $ghu")
         case None      => logger.error("Could not detect GitHub username from git config")
@@ -78,72 +79,63 @@ object ChatClient extends IOApp:
       socket: Socket[IO],
       myUsername: String,
       state: Ref[IO, ClientState]
-  ): IO[Unit] =
-    for
-      _ <- sendInitialData(socket, state)
-      _ <- handleChat(socket, myUsername, state)
-    yield ()
-
-  private def sendInitialData(socket: Socket[IO], state: Ref[IO, ClientState]): IO[Unit] =
-    for
+  ): IO[Unit] = {
+    val initialDataIO: IO[String] = for {
       hostname <- IO
         .blocking(java.net.InetAddress.getLocalHost.getHostName)
         .handleError(_ => "unknown-client")
       currentState <- state.get
-
-      privateKey <- currentState.githubUsername match
-        case Some(ghu) =>
-          Authentication
-            .loadPrivateKey()
-            .map(_.toOption)
-            .handleErrorWith { err =>
-              logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
-            }
-        case None => IO.pure(None)
-
-      _ <- privateKey match
-        case Some(key) => state.update(_.copy(privateKey = Some(key)))
-        case None      => IO.unit
-
-      authData = currentState.githubUsername match
-        case Some(ghu) if privateKey.isDefined => s"\nauto-auth:$ghu"
-        case _                                 => ""
-
-      _ <- Stream
-        .emit(s"$hostname$authData\n")
-        .through(text.utf8.encode)
-        .through(socket.writes)
-        .compile
-        .drain
-    yield ()
-
-  private def handleChat(
-      socket: Socket[IO],
-      myUsername: String,
-      state: Ref[IO, ClientState]
-  ): IO[Unit] =
-    Queue.unbounded[IO, String].flatMap { outgoingQueue =>
-      val serverReader = readFromServer(socket, myUsername, state, outgoingQueue)
-      val userReader = readFromUser(outgoingQueue)
-      val serverWriter = writeToServer(socket, outgoingQueue)
-
-      serverReader.both(userReader).both(serverWriter).void.handleErrorWith { err =>
-        logger.error(s"\nConnection error: ${err.getMessage}")
+      privateKey <- currentState.githubUsername.flatTraverse { _ =>
+        Authentication.loadPrivateKey().map(_.toOption).handleErrorWith { err =>
+          logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
+        }
       }
+      _ <- privateKey.traverse_(key => state.update(_.copy(privateKey = Some(key))))
+      authData = currentState.githubUsername
+        .filter(_ => privateKey.isDefined)
+        .map(ghu => s"auto-auth:$ghu")
+        .getOrElse("")
+      finalString = List(hostname, authData).filter(_.nonEmpty).mkString("\n") + "\n\n"
+      _ <- logger.info(s"Prepared initial data to send.")
+    } yield finalString
+
+    Queue.unbounded[IO, String].flatMap { outgoingQueue =>
+      val serverWriter: Stream[IO, Nothing] =
+        (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
+          .map(_ + "\n")
+          .evalTap(data => logger.info(s"Writing to server: $data"))
+          .through(text.utf8.encode)
+          .through(socket.writes)
+          .onFinalize(logger.info("Server writer stream finished."))
+
+      val serverReader: Stream[IO, Unit] =
+        readFromServer(socket, myUsername, state, outgoingQueue)
+          .onFinalize(logger.info("Server reader stream finished."))
+
+      val userReader: Stream[IO, Unit] =
+        readFromUser(outgoingQueue)
+          .onFinalize(logger.info("User reader stream finished."))
+
+      logger.info("Starting chat streams...") >>
+        Stream(serverReader, serverWriter, userReader).parJoinUnbounded.compile.drain
+          .handleErrorWith { err =>
+            logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
+          }
     }
+  }
 
   private def readFromServer(
       socket: Socket[IO],
       myUsername: String,
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String]
-  ): IO[Unit] =
+  ): Stream[IO, Nothing] =
     socket.reads
       .through(text.utf8.decode)
       .through(text.lines)
       .filter(_.nonEmpty)
       .evalMap { msg =>
-        if msg.startsWith("CHALLENGE:") then handleAutoChallenge(msg.drop(10), state, socket)
+        if msg.startsWith("CHALLENGE:") then handleAutoChallenge(msg.drop(10), state, outgoingQueue)
         else if msg.startsWith("Challenge: ") then
           handleManualChallenge(msg.drop(11), state, outgoingQueue)
         else if msg.contains("Authentication successful!") then
@@ -151,38 +143,32 @@ object ChatClient extends IOApp:
             IO.println(s"\r$msg") >>
             logger.info("You can now start chatting!")
         else
-          for
-            _ <- IO.println(s"\r$msg")
-            _ <- checkForMentions(msg, myUsername)
-            _ <- checkForPings(msg, myUsername)
-          yield ()
+          IO.println(s"\r$msg") >>
+            checkForMentions(msg, myUsername) >>
+            checkForPings(msg, myUsername)
       }
-      .compile
       .drain
 
   private def handleAutoChallenge(
       challenge: String,
       state: Ref[IO, ClientState],
-      socket: Socket[IO]
+      outgoingQueue: Queue[IO, String]
   ): IO[Unit] =
-    for
+    for {
       currentState <- state.get
-      _ <- (currentState.privateKey, currentState.githubUsername) match
+      _ <- (currentState.privateKey, currentState.githubUsername) match {
         case (Some(privateKey), Some(githubUsername)) =>
-          for
-            _ <- logger.debug(s"Received auto-auth challenge, signing...")
+          for {
+            _ <- logger.debug(s"Received auto-auth challenge, signing for '$githubUsername'...")
             signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
-            _ <- Stream
-              .emit(s"SIGNATURE:$signature\n")
-              .through(text.utf8.encode)
-              .through(socket.writes)
-              .compile
-              .drain
-            _ <- logger.debug(s"Auto-authentication response sent for $githubUsername")
-          yield ()
+            _ <- outgoingQueue.offer(s"SIGNATURE:$signature")
+            _ <- logger.debug("Auto-authentication response sent to queue.")
+          } yield ()
+
         case _ =>
-          logger.debug("Cannot auto-authenticate: missing private key or GitHub username")
-    yield ()
+          logger.debug("Cannot auto-authenticate: missing private key or GitHub username.")
+      }
+    } yield ()
 
   private def handleManualChallenge(
       challenge: String,
@@ -202,21 +188,11 @@ object ChatClient extends IOApp:
           logger.error("Cannot sign challenge: SSH private key not loaded")
     yield ()
 
-  private def readFromUser(outgoingQueue: Queue[IO, String]): IO[Unit] =
+  private def readFromUser(outgoingQueue: Queue[IO, String]): Stream[IO, Nothing] =
     Stream
       .repeatEval(Console[IO].readLine)
-      .takeWhile(_ != "/quit")
-      .evalMap(line => outgoingQueue.offer(line))
-      .compile
-      .drain
-
-  private def writeToServer(socket: Socket[IO], outgoingQueue: Queue[IO, String]): IO[Unit] =
-    Stream
-      .fromQueueUnterminated(outgoingQueue)
-      .map(_ + "\n")
-      .through(text.utf8.encode)
-      .through(socket.writes)
-      .compile
+      .takeWhile(s => s != null && s != "/quit")
+      .foreach(outgoingQueue.offer)
       .drain
 
   private def checkForMentions(line: String, myUsername: String): IO[Unit] =
