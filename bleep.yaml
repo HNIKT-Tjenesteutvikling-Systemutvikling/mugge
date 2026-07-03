@@ -19,6 +19,7 @@ projects:
       - template-jvm
     folder: ./client
     sources: ./src
+    resources: ./src/resources
     platform:
       main-class: chat.ChatClient$
       name: jvm

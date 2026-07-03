@@ -54,7 +54,7 @@ object ChatClient extends IOApp:
         .client(SocketAddress(host, port))
         .use { socket =>
           for
-            _ <- logger.info(s"Connected to chat server at $host:$port!")
+            _ <- IO.println(s"Connected to chat server at $host:$port")
             state <- Ref.of[IO, ClientState](
               ClientState(
                 githubUsername = githubUsername
@@ -71,9 +71,15 @@ object ChatClient extends IOApp:
         }
     yield exitCode
 
+  private def getHostname: IO[String] =
+    sys.env.get("MUGGE_HOSTNAME") match
+      case Some(hostname) => IO.pure(hostname)
+      case None =>
+        IO.blocking(java.net.InetAddress.getLocalHost.getHostName)
+          .handleError(_ => "unknown-client")
+
   private def getUsername: IO[String] =
-    IO.blocking(java.net.InetAddress.getLocalHost.getHostName)
-      .map(UserMapping.mapHostname)
+    getHostname.map(UserMapping.mapHostname)
 
   private def handleConnection(
       socket: Socket[IO],
@@ -81,14 +87,19 @@ object ChatClient extends IOApp:
       state: Ref[IO, ClientState]
   ): IO[Unit] = {
     val initialDataIO: IO[String] = for {
-      hostname <- IO
-        .blocking(java.net.InetAddress.getLocalHost.getHostName)
-        .handleError(_ => "unknown-client")
+      hostname <- getHostname
       currentState <- state.get
       privateKey <- currentState.githubUsername.flatTraverse { _ =>
-        Authentication.loadPrivateKey().map(_.toOption).handleErrorWith { err =>
-          logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
-        }
+        Authentication
+          .loadPrivateKey()
+          .flatMap {
+            case Right(key) => IO.pure(Some(key))
+            case Left(err) =>
+              logger.warn(s"Could not load SSH private key: ${err.message}").as(None)
+          }
+          .handleErrorWith { err =>
+            logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
+          }
       }
       _ <- privateKey.traverse_(key => state.update(_.copy(privateKey = Some(key))))
       authData = currentState.githubUsername
@@ -141,7 +152,7 @@ object ChatClient extends IOApp:
         else if msg.contains("Authentication successful!") then
           state.update(_.copy(authenticated = true)) >>
             IO.println(s"\r$msg") >>
-            logger.info("You can now start chatting!")
+            IO.println("You can now start chatting!")
         else
           IO.println(s"\r$msg") >>
             checkForMentions(msg, myUsername) >>

@@ -107,6 +107,17 @@ rec {
   muggeClient = pkgs.writeShellScriptBin "mugge" ''
     #!${pkgs.bash}/bin/bash
 
+    # Runtime tools the client shells out to: ssh-keygen, openssl (key
+    # conversion), git (username detection), notify-send (mentions).
+    export PATH=${
+      pkgs.lib.makeBinPath [
+        pkgs.openssh
+        pkgs.openssl
+        pkgs.git
+        pkgs.libnotify
+      ]
+    }:$PATH
+
     GREEN='\033[0;32m'
     BLUE='\033[0;34m'
     YELLOW='\033[1;33m'
