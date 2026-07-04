@@ -25,8 +25,48 @@ object ChatClient extends IOApp:
   case class ClientState(
       authenticated: Boolean = false,
       githubUsername: Option[String] = None,
-      privateKey: Option[PrivateKey] = None
+      privateKey: Option[PrivateKey] = None,
+      colors: Map[String, String] = Map.empty
   )
+
+  private val ansiReset = "\u001b[0m"
+
+  // Distinct 256-color foregrounds; assigned per sender in order of first
+  // appearance so concurrent chatters stay visually separated.
+  private val ansiPalette: Vector[String] = Vector(
+    "\u001b[38;5;39m",
+    "\u001b[38;5;208m",
+    "\u001b[38;5;46m",
+    "\u001b[38;5;201m",
+    "\u001b[38;5;226m",
+    "\u001b[38;5;51m",
+    "\u001b[38;5;196m",
+    "\u001b[38;5;129m",
+    "\u001b[38;5;118m",
+    "\u001b[38;5;214m",
+    "\u001b[38;5;45m",
+    "\u001b[38;5;213m"
+  )
+
+  private val displayPattern =
+    """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
+
+  private def colorFor(name: String, state: Ref[IO, ClientState]): IO[String] =
+    state.modify { st =>
+      st.colors.get(name) match
+        case Some(color) => (st, color)
+        case None =>
+          val color = ansiPalette(st.colors.size % ansiPalette.size)
+          (st.copy(colors = st.colors + (name -> color)), color)
+    }
+
+  private def colorizeForDisplay(msg: String, state: Ref[IO, ClientState]): IO[String] =
+    msg match
+      case displayPattern(time, indicator, sender, content) =>
+        colorFor(sender.trim, state).map { color =>
+          s"[$time] $indicator $color$sender$ansiReset: $content"
+        }
+      case _ => IO.pure(msg)
 
   def run(args: List[String]): IO[ExitCode] =
     val host = args.headOption
@@ -154,7 +194,7 @@ object ChatClient extends IOApp:
             IO.println(s"\r$msg") >>
             IO.println("You can now start chatting!")
         else
-          IO.println(s"\r$msg") >>
+          colorizeForDisplay(msg, state).flatMap(colored => IO.println(s"\r$colored")) >>
             checkForMentions(msg, myUsername) >>
             checkForPings(msg, myUsername)
       }
