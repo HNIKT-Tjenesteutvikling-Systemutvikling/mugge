@@ -1,7 +1,7 @@
 package chat
 
 import cats.effect.*
-import cats.effect.std.{Console, Queue}
+import cats.effect.std.{Console, Mutex, Queue}
 import cats.syntax.all.*
 import fs2.*
 import fs2.io.net.*
@@ -26,7 +26,8 @@ object ChatClient extends IOApp:
       authenticated: Boolean = false,
       githubUsername: Option[String] = None,
       privateKey: Option[PrivateKey] = None,
-      colors: Map[String, Int] = Map.empty
+      colors: Map[String, Int] = Map.empty,
+      onlineUsers: List[String] = Nil
   )
 
   private val ansiReset = "\u001b[0m"
@@ -91,6 +92,68 @@ object ChatClient extends IOApp:
             s"[$time] $indicator $bright$sender$ansiReset: $dim$content$ansiReset"
           }
       case _ => IO.pure(msg)
+
+  private val panelWidth = 24
+
+  // (cols, rows) when stdout is an interactive TTY, else None (piped/redirected).
+  // Reads the size from the controlling terminal (/dev/tty) rather than `tput`,
+  // whose result would be the 80-col default when our stdout is captured.
+  private def detectTerminal: IO[Option[(Int, Int)]] =
+    if System.console() == null then IO.pure(None)
+    else
+      IO.blocking(Seq("sh", "-c", "stty size < /dev/tty").!!.trim)
+        .map { out =>
+          out.split("\\s+").toList match
+            case rows :: cols :: Nil =>
+              (cols.toIntOption, rows.toIntOption).tupled
+            case _ => None
+        }
+        .handleError(_ => None)
+
+  // Serializes all terminal writes so chat lines and the right-hand online-users
+  // panel never interleave mid-escape. Without a TTY it degrades to plain lines.
+  final class Ui(
+      mutex: Mutex[IO],
+      state: Ref[IO, ClientState],
+      term: Option[(Int, Int)]
+  ):
+    def printLine(line: String): IO[Unit] =
+      mutex.lock.surround {
+        term match
+          case None => Console[IO].println(line)
+          case Some((cols, rows)) =>
+            Console[IO].print(s"\r$line\n") *> redraw(cols, rows)
+      }
+
+    def setUsers(users: List[String]): IO[Unit] =
+      state.update(_.copy(onlineUsers = users)) *>
+        mutex.lock.surround {
+          term match
+            case None               => Console[IO].println(s"Online: ${users.mkString(", ")}")
+            case Some((cols, rows)) => redraw(cols, rows)
+        }
+
+    private def redraw(cols: Int, rows: Int): IO[Unit] =
+      for
+        st <- state.get
+        startCol = math.max(1, cols - panelWidth + 1)
+        clearRows = math.min(rows - 1, 30)
+        visible = st.onlineUsers.take(math.max(0, clearRows - 1))
+        colored <- visible.traverse(u => colorIndexFor(u, state).map(idx => (u, ansiPalette(idx))))
+        sb = new StringBuilder
+        _ = sb.append("\u001b7") // save cursor + attrs
+        _ = (1 to clearRows).foreach { r =>
+          sb.append(s"\u001b[$r;${startCol}H")
+          sb.append(" " * panelWidth)
+        }
+        _ = sb.append(s"\u001b[1;${startCol}H\u001b[1m\u2524 Online (${st.onlineUsers.size})\u001b[0m")
+        _ = colored.zipWithIndex.foreach { case ((u, color), i) =>
+          val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
+          sb.append(s"\u001b[${2 + i};${startCol}H$color\u2022 $name$ansiReset")
+        }
+        _ = sb.append("\u001b8") // restore cursor
+        _ <- Console[IO].print(sb.toString)
+      yield ()
 
   def run(args: List[String]): IO[ExitCode] =
     val host = args.headOption
@@ -174,33 +237,39 @@ object ChatClient extends IOApp:
       _ <- logger.info(s"Prepared initial data to send.")
     } yield finalString
 
-    (Queue.unbounded[IO, String], Deferred[IO, Either[Throwable, Unit]]).tupled.flatMap {
-      case (outgoingQueue, halt) =>
-        val serverWriter: Stream[IO, Nothing] =
-          (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
-            .map(_ + "\n")
-            .evalTap(data => logger.info(s"Writing to server: $data"))
-            .through(text.utf8.encode)
-            .through(socket.writes)
-            .onFinalize(logger.info("Server writer stream finished."))
+    (
+      detectTerminal,
+      Mutex[IO],
+      Queue.unbounded[IO, String],
+      Deferred[IO, Either[Throwable, Unit]]
+    ).tupled.flatMap { case (term, mutex, outgoingQueue, halt) =>
+      val ui = new Ui(mutex, state, term)
 
-        val serverReader: Stream[IO, Unit] =
-          readFromServer(socket, myUsername, state, outgoingQueue)
-            .onFinalize(logger.info("Server reader stream finished."))
+      val serverWriter: Stream[IO, Nothing] =
+        (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
+          .map(_ + "\n")
+          .evalTap(data => logger.info(s"Writing to server: $data"))
+          .through(text.utf8.encode)
+          .through(socket.writes)
+          .onFinalize(logger.info("Server writer stream finished."))
 
-        val userReader: Stream[IO, Unit] =
-          readFromUser(outgoingQueue, halt)
-            .onFinalize(logger.info("User reader stream finished."))
+      val serverReader: Stream[IO, Unit] =
+        readFromServer(socket, myUsername, state, outgoingQueue, ui)
+          .onFinalize(logger.info("Server reader stream finished."))
 
-        logger.info("Starting chat streams...") >>
-          Stream(serverReader, serverWriter, userReader).parJoinUnbounded
-            .interruptWhen(halt)
-            .compile
-            .drain
-            .handleErrorWith { err =>
-              logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
-            } >>
-          IO.println("Bye!")
+      val userReader: Stream[IO, Unit] =
+        readFromUser(outgoingQueue, halt)
+          .onFinalize(logger.info("User reader stream finished."))
+
+      logger.info("Starting chat streams...") >>
+        Stream(serverReader, serverWriter, userReader).parJoinUnbounded
+          .interruptWhen(halt)
+          .compile
+          .drain
+          .handleErrorWith { err =>
+            logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
+          } >>
+        IO.println("Bye!")
     }
   }
 
@@ -208,7 +277,8 @@ object ChatClient extends IOApp:
       socket: Socket[IO],
       myUsername: String,
       state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String]
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
   ): Stream[IO, Nothing] =
     socket.reads
       .through(text.utf8.decode)
@@ -218,12 +288,15 @@ object ChatClient extends IOApp:
         if msg.startsWith("CHALLENGE:") then handleAutoChallenge(msg.drop(10), state, outgoingQueue)
         else if msg.startsWith("Challenge: ") then
           handleManualChallenge(msg.drop(11), state, outgoingQueue)
+        else if msg.startsWith("USERS:") then
+          val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
+          ui.setUsers(users)
         else if msg.contains("Authentication successful!") then
           state.update(_.copy(authenticated = true)) >>
-            IO.println(s"\r$msg") >>
-            IO.println("You can now start chatting!")
+            ui.printLine(msg) >>
+            ui.printLine("You can now start chatting!")
         else
-          colorizeForDisplay(msg, state).flatMap(colored => IO.println(s"\r$colored")) >>
+          colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
             checkForMentions(msg, myUsername) >>
             checkForPings(msg, myUsername)
       }

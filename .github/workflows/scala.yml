@@ -28,7 +28,7 @@ jobs:
     outputs:
       scala_changed: ${{ steps.filter.outputs.scala_changed }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
@@ -58,7 +58,7 @@ jobs:
     needs: matrix
     if: needs.matrix.outputs.scala_changed == 'true'
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v30
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
