@@ -84,7 +84,9 @@ object ChatClient extends IOApp:
     msg match
       case displayPattern(time, indicator, sender, content) =>
         if sender.trim == "SERVER" then
-          IO.pure(s"[$time] $indicator $serverColor$sender$ansiReset: $serverColor$content$ansiReset")
+          IO.pure(
+            s"[$time] $indicator $serverColor$sender$ansiReset: $serverColor$content$ansiReset"
+          )
         else
           colorIndexFor(sender.trim, state).map { idx =>
             val bright = ansiPalette(idx)
@@ -146,7 +148,9 @@ object ChatClient extends IOApp:
           sb.append(s"\u001b[$r;${startCol}H")
           sb.append(" " * panelWidth)
         }
-        _ = sb.append(s"\u001b[1;${startCol}H\u001b[1m\u2524 Online (${st.onlineUsers.size})\u001b[0m")
+        _ = sb.append(
+          s"\u001b[1;${startCol}H\u001b[1m\u2524 Online (${st.onlineUsers.size})\u001b[0m"
+        )
         _ = colored.zipWithIndex.foreach { case ((u, color), i) =>
           val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
           sb.append(s"\u001b[${2 + i};${startCol}H$color\u2022 $name$ansiReset")
