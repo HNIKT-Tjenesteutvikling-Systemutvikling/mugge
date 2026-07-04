@@ -150,28 +150,33 @@ object ChatClient extends IOApp:
       _ <- logger.info(s"Prepared initial data to send.")
     } yield finalString
 
-    Queue.unbounded[IO, String].flatMap { outgoingQueue =>
-      val serverWriter: Stream[IO, Nothing] =
-        (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
-          .map(_ + "\n")
-          .evalTap(data => logger.info(s"Writing to server: $data"))
-          .through(text.utf8.encode)
-          .through(socket.writes)
-          .onFinalize(logger.info("Server writer stream finished."))
+    (Queue.unbounded[IO, String], Deferred[IO, Either[Throwable, Unit]]).tupled.flatMap {
+      case (outgoingQueue, halt) =>
+        val serverWriter: Stream[IO, Nothing] =
+          (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
+            .map(_ + "\n")
+            .evalTap(data => logger.info(s"Writing to server: $data"))
+            .through(text.utf8.encode)
+            .through(socket.writes)
+            .onFinalize(logger.info("Server writer stream finished."))
 
-      val serverReader: Stream[IO, Unit] =
-        readFromServer(socket, myUsername, state, outgoingQueue)
-          .onFinalize(logger.info("Server reader stream finished."))
+        val serverReader: Stream[IO, Unit] =
+          readFromServer(socket, myUsername, state, outgoingQueue)
+            .onFinalize(logger.info("Server reader stream finished."))
 
-      val userReader: Stream[IO, Unit] =
-        readFromUser(outgoingQueue)
-          .onFinalize(logger.info("User reader stream finished."))
+        val userReader: Stream[IO, Unit] =
+          readFromUser(outgoingQueue, halt)
+            .onFinalize(logger.info("User reader stream finished."))
 
-      logger.info("Starting chat streams...") >>
-        Stream(serverReader, serverWriter, userReader).parJoinUnbounded.compile.drain
-          .handleErrorWith { err =>
-            logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
-          }
+        logger.info("Starting chat streams...") >>
+          Stream(serverReader, serverWriter, userReader).parJoinUnbounded
+            .interruptWhen(halt)
+            .compile
+            .drain
+            .handleErrorWith { err =>
+              logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
+            } >>
+          IO.println("Bye!")
     }
   }
 
@@ -239,11 +244,16 @@ object ChatClient extends IOApp:
           logger.error("Cannot sign challenge: SSH private key not loaded")
     yield ()
 
-  private def readFromUser(outgoingQueue: Queue[IO, String]): Stream[IO, Nothing] =
+  private def readFromUser(
+      outgoingQueue: Queue[IO, String],
+      halt: Deferred[IO, Either[Throwable, Unit]]
+  ): Stream[IO, Nothing] =
     Stream
       .repeatEval(Console[IO].readLine)
-      .takeWhile(s => s != null && s != "/quit")
-      .foreach(outgoingQueue.offer)
+      .evalMap {
+        case s if s == null || s == "/quit" => halt.complete(Right(())).void
+        case s                              => outgoingQueue.offer(s)
+      }
       .drain
 
   private def checkForMentions(line: String, myUsername: String): IO[Unit] =
