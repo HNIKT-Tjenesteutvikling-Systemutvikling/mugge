@@ -26,7 +26,7 @@ object ChatClient extends IOApp:
       authenticated: Boolean = false,
       githubUsername: Option[String] = None,
       privateKey: Option[PrivateKey] = None,
-      colors: Map[String, String] = Map.empty
+      colors: Map[String, Int] = Map.empty
   )
 
   private val ansiReset = "\u001b[0m"
@@ -48,24 +48,48 @@ object ChatClient extends IOApp:
     "\u001b[38;5;213m"
   )
 
+  // Darker twin of each entry in ansiPalette (same index), used for the
+  // message body so a sender's text reads as a weaker shade of their name.
+  private val ansiDimPalette: Vector[String] = Vector(
+    "\u001b[38;5;25m",
+    "\u001b[38;5;130m",
+    "\u001b[38;5;28m",
+    "\u001b[38;5;90m",
+    "\u001b[38;5;100m",
+    "\u001b[38;5;30m",
+    "\u001b[38;5;88m",
+    "\u001b[38;5;54m",
+    "\u001b[38;5;64m",
+    "\u001b[38;5;136m",
+    "\u001b[38;5;24m",
+    "\u001b[38;5;96m"
+  )
+
+  private val serverColor = "\u001b[38;5;245m"
+
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
 
-  private def colorFor(name: String, state: Ref[IO, ClientState]): IO[String] =
+  private def colorIndexFor(name: String, state: Ref[IO, ClientState]): IO[Int] =
     state.modify { st =>
       st.colors.get(name) match
-        case Some(color) => (st, color)
+        case Some(idx) => (st, idx)
         case None =>
-          val color = ansiPalette(st.colors.size % ansiPalette.size)
-          (st.copy(colors = st.colors + (name -> color)), color)
+          val idx = st.colors.size % ansiPalette.size
+          (st.copy(colors = st.colors + (name -> idx)), idx)
     }
 
   private def colorizeForDisplay(msg: String, state: Ref[IO, ClientState]): IO[String] =
     msg match
       case displayPattern(time, indicator, sender, content) =>
-        colorFor(sender.trim, state).map { color =>
-          s"[$time] $indicator $color$sender$ansiReset: $content"
-        }
+        if sender.trim == "SERVER" then
+          IO.pure(s"[$time] $indicator $serverColor$sender$ansiReset: $serverColor$content$ansiReset")
+        else
+          colorIndexFor(sender.trim, state).map { idx =>
+            val bright = ansiPalette(idx)
+            val dim = ansiDimPalette(idx)
+            s"[$time] $indicator $bright$sender$ansiReset: $dim$content$ansiReset"
+          }
       case _ => IO.pure(msg)
 
   def run(args: List[String]): IO[ExitCode] =
