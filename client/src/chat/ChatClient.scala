@@ -27,6 +27,13 @@ object ChatClient extends IOApp:
   private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
   private val fileChunkSize = 48 * 1024 // raw bytes per chunk before base64
 
+  // Application-level heartbeat: keeps the TCP flow non-idle so Azure's load
+  // balancer (~4 min idle drop) never silently kills a quiet connection, and
+  // doubles as a server-process liveness probe. deadAfter spans ~3 PONGs.
+  private val pingInterval = 60.seconds
+  private val watchdogInterval = 30.seconds
+  private val deadAfter = 3.minutes
+
   // Sender-side: file the local user offered, kept until FILEACCEPT/FILEREJECT.
   case class OutgoingFile(path: Path, name: String, size: Long)
 
@@ -205,8 +212,8 @@ object ChatClient extends IOApp:
                 githubUsername = githubUsername
               )
             )
-            _ <- handleConnection(socket, myUsername, state)
-          yield ExitCode.Success
+            code <- handleConnection(socket, myUsername, state)
+          yield code
         }
         .handleErrorWith {
           case _: IOException =>
@@ -230,7 +237,7 @@ object ChatClient extends IOApp:
       socket: Socket[IO],
       myUsername: String,
       state: Ref[IO, ClientState]
-  ): IO[Unit] = {
+  ): IO[ExitCode] = {
     val initialDataIO: IO[String] = for {
       hostname <- getHostname
       currentState <- state.get
@@ -259,35 +266,67 @@ object ChatClient extends IOApp:
       detectTerminal,
       Mutex[IO],
       Queue.unbounded[IO, String],
-      Deferred[IO, Either[Throwable, Unit]]
-    ).tupled.flatMap { case (term, mutex, outgoingQueue, halt) =>
+      Deferred[IO, Either[Throwable, Unit]],
+      IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
+      Ref.of[IO, Boolean](false)
+    ).tupled.flatMap { case (term, mutex, outgoingQueue, halt, lastReceived, connectionLost) =>
       val ui = new Ui(mutex, state, term)
 
       val serverWriter: Stream[IO, Nothing] =
         (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
           .map(_ + "\n")
-          .evalTap(data => logger.info(s"Writing to server: $data"))
+          .evalTap {
+            case data if data.trim == "PING" => IO.unit // heartbeat stays invisible client-side
+            case data                        => logger.info(s"Writing to server: $data")
+          }
           .through(text.utf8.encode)
           .through(socket.writes)
           .onFinalize(logger.info("Server writer stream finished."))
 
       val serverReader: Stream[IO, Unit] =
-        readFromServer(socket, myUsername, state, outgoingQueue, ui)
+        readFromServer(socket, myUsername, state, outgoingQueue, ui, lastReceived)
           .onFinalize(logger.info("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
         readFromUser(outgoingQueue, halt, state, ui)
           .onFinalize(logger.info("User reader stream finished."))
 
+      val pinger: Stream[IO, Unit] =
+        Stream
+          .awakeEvery[IO](pingInterval)
+          .evalMap(_ => outgoingQueue.offer("PING"))
+
+      // Trips when no line (chat, PONG, anything) has arrived for deadAfter,
+      // turning a silent Azure drop into a clean teardown + nonzero exit so a
+      // supervisor (task 8) restarts us instead of us looking alive but deaf.
+      val watchdog: Stream[IO, Unit] =
+        Stream.awakeEvery[IO](watchdogInterval).evalMap { _ =>
+          for
+            now <- IO.monotonic
+            last <- lastReceived.get
+            _ <-
+              if (now - last) > deadAfter then
+                connectionLost.set(true) *>
+                  ui.printLine("Connection lost: no response from server.") *>
+                  halt.complete(Right(())).void
+              else IO.unit
+          yield ()
+        }
+
       logger.info("Starting chat streams...") >>
-        Stream(serverReader, serverWriter, userReader).parJoinUnbounded
+        Stream(serverReader, serverWriter, userReader, pinger, watchdog).parJoinUnbounded
           .interruptWhen(halt)
           .compile
           .drain
           .handleErrorWith { err =>
-            logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
+            connectionLost.set(true) *>
+              logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
           } >>
-        IO.println("Bye!")
+        connectionLost.get.flatMap { lost =>
+          if lost then
+            IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
+          else IO.println("Bye!").as(ExitCode.Success)
+        }
     }
   }
 
@@ -296,33 +335,38 @@ object ChatClient extends IOApp:
       myUsername: String,
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String],
-      ui: Ui
+      ui: Ui,
+      lastReceived: Ref[IO, FiniteDuration]
   ): Stream[IO, Nothing] =
     socket.reads
       .through(text.utf8.decode)
       .through(text.lines)
       .filter(_.nonEmpty)
       .evalMap { msg =>
-        if msg.startsWith("CHALLENGE:") then handleAutoChallenge(msg.drop(10), state, outgoingQueue)
-        else if msg.startsWith("Challenge: ") then
-          handleManualChallenge(msg.drop(11), state, outgoingQueue)
-        else if msg.startsWith("USERS:") then
-          val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
-          ui.setUsers(users)
-        else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
-        else if msg.startsWith("FILEACCEPT:") then
-          handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
-        else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
-        else if msg.startsWith("FILEDATA:") then handleFileData(msg, state)
-        else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
-        else if msg.contains("Authentication successful!") then
-          state.update(_.copy(authenticated = true)) >>
-            ui.printLine(msg) >>
-            ui.printLine("You can now start chatting!")
-        else
-          colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
-            checkForMentions(msg, myUsername) >>
-            checkForPings(msg, myUsername)
+        IO.monotonic.flatMap(lastReceived.set) *> {
+          if msg == "PONG" then IO.unit
+          else if msg.startsWith("CHALLENGE:") then
+            handleAutoChallenge(msg.drop(10), state, outgoingQueue)
+          else if msg.startsWith("Challenge: ") then
+            handleManualChallenge(msg.drop(11), state, outgoingQueue)
+          else if msg.startsWith("USERS:") then
+            val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
+            ui.setUsers(users)
+          else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
+          else if msg.startsWith("FILEACCEPT:") then
+            handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
+          else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
+          else if msg.startsWith("FILEDATA:") then handleFileData(msg, state)
+          else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
+          else if msg.contains("Authentication successful!") then
+            state.update(_.copy(authenticated = true)) >>
+              ui.printLine(msg) >>
+              ui.printLine("You can now start chatting!")
+          else
+            colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
+              checkForMentions(msg, myUsername) >>
+              checkForPings(msg, myUsername)
+        }
       }
       .drain
 
