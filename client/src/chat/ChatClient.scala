@@ -34,6 +34,10 @@ object ChatClient extends IOApp:
   private val watchdogInterval = 30.seconds
   private val deadAfter = 3.minutes
 
+  // How often the sender re-asserts TYPING while still composing; must stay
+  // under the server's ~5s typing lease so the indicator doesn't lapse.
+  private val typingRefreshInterval = 3.seconds
+
   // Sender-side: file the local user offered, kept until FILEACCEPT/FILEREJECT.
   case class OutgoingFile(path: Path, name: String, size: Long)
 
@@ -47,6 +51,7 @@ object ChatClient extends IOApp:
       privateKey: Option[PrivateKey] = None,
       colors: Map[String, Int] = Map.empty,
       onlineUsers: List[String] = Nil,
+      typingUsers: List[String] = Nil,
       outgoingFiles: Map[String, OutgoingFile] = Map.empty,
       incomingFiles: Map[String, IncomingFile] = Map.empty
   )
@@ -133,19 +138,39 @@ object ChatClient extends IOApp:
         }
         .handleError(_ => None)
 
-  // Serializes all terminal writes so chat lines and the right-hand online-users
-  // panel never interleave mid-escape. Without a TTY it degrades to plain lines.
+  private val inputPrompt = "> "
+
+  // "user1 is typing..." style summary; None when nobody (else) is typing.
+  private def formatTyping(users: List[String]): Option[String] =
+    users match
+      case Nil      => None
+      case a :: Nil => Some(s"$a is typing...")
+      case _ =>
+        val init = users.init.mkString(", ")
+        Some(s"$init and ${users.last} is typing...")
+
+  // Owns all terminal output. On a TTY it keeps a "live block" pinned at the
+  // bottom — an optional dimmed typing-status line plus the prompt+input line —
+  // that is erased and repainted around every incoming chat line, so the user's
+  // in-progress input survives other people's messages and, crucially, the typed
+  // text is cleared on Enter (the server echo is the only copy that remains).
+  // All writes are serialized through the mutex so nothing interleaves
+  // mid-escape. Without a TTY it degrades to plain lines (no panel, no input
+  // rendering, no escapes).
   final class Ui(
       mutex: Mutex[IO],
       state: Ref[IO, ClientState],
+      input: Ref[IO, String],
+      blockLines: Ref[IO, Int],
       term: Option[(Int, Int)]
   ):
+    def isTty: Boolean = term.isDefined
+
     def printLine(line: String): IO[Unit] =
       mutex.lock.surround {
         term match
-          case None => Console[IO].println(line)
-          case Some((cols, rows)) =>
-            Console[IO].print(s"\r$line\n") *> redraw(cols, rows)
+          case None               => Console[IO].println(line)
+          case Some((cols, rows)) => render(Some(line), cols, rows)
       }
 
     def setUsers(users: List[String]): IO[Unit] =
@@ -153,32 +178,80 @@ object ChatClient extends IOApp:
         mutex.lock.surround {
           term match
             case None               => Console[IO].println(s"Online: ${users.mkString(", ")}")
-            case Some((cols, rows)) => redraw(cols, rows)
+            case Some((cols, rows)) => render(None, cols, rows)
         }
 
-    private def redraw(cols: Int, rows: Int): IO[Unit] =
+    def setTyping(users: List[String]): IO[Unit] =
+      state.update(_.copy(typingUsers = users)) *>
+        mutex.lock.surround {
+          term match
+            case None               => IO.unit
+            case Some((cols, rows)) => render(None, cols, rows)
+        }
+
+    // Repaint the live block after a keystroke (input/typing change).
+    def refreshInput: IO[Unit] =
+      mutex.lock.surround {
+        term match
+          case None               => IO.unit
+          case Some((cols, rows)) => render(None, cols, rows)
+      }
+
+    // Erase the previously drawn block, optionally emit one chat line above it,
+    // repaint the block, then repaint the panel — as a single write.
+    private def render(chat: Option[String], cols: Int, rows: Int): IO[Unit] =
       for
         st <- state.get
+        inp <- input.get
+        prev <- blockLines.get
         startCol = math.max(1, cols - panelWidth + 1)
         clearRows = math.min(rows - 1, 30)
         visible = st.onlineUsers.take(math.max(0, clearRows - 1))
         colored <- visible.traverse(u => colorIndexFor(u, state).map(idx => (u, ansiPalette(idx))))
+        (blockStr, newCount) = renderBlock(st, inp)
         sb = new StringBuilder
-        _ = sb.append("\u001b7") // save cursor + attrs
-        _ = (1 to clearRows).foreach { r =>
-          sb.append(s"\u001b[$r;${startCol}H")
-          sb.append(" " * panelWidth)
-        }
-        _ = sb.append(
-          s"\u001b[1;${startCol}H\u001b[1m\u2524 Online (${st.onlineUsers.size})\u001b[0m"
-        )
-        _ = colored.zipWithIndex.foreach { case ((u, color), i) =>
-          val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
-          sb.append(s"\u001b[${2 + i};${startCol}H$color\u2022 $name$ansiReset")
-        }
-        _ = sb.append("\u001b8") // restore cursor
+        _ = sb.append(eraseBlock(prev))
+        _ = chat.foreach(l => sb.append(l).append("\n"))
+        _ = sb.append(blockStr)
+        _ = sb.append(panelStr(colored, st.onlineUsers.size, startCol, clearRows))
         _ <- Console[IO].print(sb.toString)
+        _ <- blockLines.set(newCount)
       yield ()
+
+    // Move from the end of the input line to the top-left of the block and
+    // clear everything below; returns the cursor to the block's origin.
+    private def eraseBlock(n: Int): String =
+      if n <= 0 then ""
+      else
+        val up = if n > 1 then s"\u001b[${n - 1}A" else ""
+        s"\r$up\u001b[0J"
+
+    // The dimmed typing line (if any) plus the prompt+input line. Cursor ends
+    // at the end of the input. Returns the rendered string and its line count.
+    private def renderBlock(st: ClientState, inp: String): (String, Int) =
+      val typingLine =
+        formatTyping(st.typingUsers).map(t => s"\r\u001b[2K\u001b[2m$t$ansiReset\n")
+      val inputLine = s"\r\u001b[2K$inputPrompt$inp"
+      val count = (if typingLine.isDefined then 1 else 0) + 1
+      (typingLine.getOrElse("") + inputLine, count)
+
+    // The right-hand online-users panel, save/restore-wrapped so it never moves
+    // the block cursor. Rendered last so a bottom-line scroll can't smear it.
+    private def panelStr(
+        colored: List[(String, String)],
+        total: Int,
+        startCol: Int,
+        clearRows: Int
+    ): String =
+      val clears =
+        (1 to clearRows).map(r => s"\u001b[$r;${startCol}H" + " " * panelWidth).mkString
+      val header = s"\u001b[1;${startCol}H\u001b[1m\u2524 Online ($total)\u001b[0m"
+      val entries = colored.zipWithIndex.map { case ((u, color), i) =>
+        val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
+        s"\u001b[${2 + i};${startCol}H$color\u2022 $name$ansiReset"
+      }.mkString
+      // \u001b7 save cursor+attrs, \u001b8 restore.
+      s"\u001b7$clears$header$entries\u001b8"
 
   def run(args: List[String]): IO[ExitCode] =
     val host = args.headOption
@@ -268,16 +341,31 @@ object ChatClient extends IOApp:
       Queue.unbounded[IO, String],
       Deferred[IO, Either[Throwable, Unit]],
       IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
-      Ref.of[IO, Boolean](false)
-    ).tupled.flatMap { case (term, mutex, outgoingQueue, halt, lastReceived, connectionLost) =>
-      val ui = new Ui(mutex, state, term)
+      Ref.of[IO, Boolean](false),
+      Ref.of[IO, String](""),
+      Ref.of[IO, Boolean](false),
+      Ref.of[IO, Int](0)
+    ).tupled.flatMap { tup =>
+      val (
+        term,
+        mutex,
+        outgoingQueue,
+        halt,
+        lastReceived,
+        connectionLost,
+        input,
+        composing,
+        blockLines
+      ) = tup
+      val ui = new Ui(mutex, state, input, blockLines, term)
 
       val serverWriter: Stream[IO, Nothing] =
         (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
           .map(_ + "\n")
           .evalTap {
-            case data if data.trim == "PING" => IO.unit // heartbeat stays invisible client-side
-            case data                        => logger.info(s"Writing to server: $data")
+            // Heartbeat + typing signals stay invisible client-side.
+            case data if controlNoise(data.trim) => IO.unit
+            case data                            => logger.info(s"Writing to server: $data")
           }
           .through(text.utf8.encode)
           .through(socket.writes)
@@ -288,13 +376,23 @@ object ChatClient extends IOApp:
           .onFinalize(logger.info("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
-        readFromUser(outgoingQueue, halt, state, ui)
+        readFromUser(outgoingQueue, halt, state, ui, input, composing)
           .onFinalize(logger.info("User reader stream finished."))
 
       val pinger: Stream[IO, Unit] =
         Stream
           .awakeEvery[IO](pingInterval)
           .evalMap(_ => outgoingQueue.offer("PING"))
+
+      // Re-assert TYPING while the user is still composing so the server's
+      // typing lease never lapses mid-word; membership-stable so it triggers
+      // no rebroadcast storm on the server side.
+      val typingRefresher: Stream[IO, Unit] =
+        Stream.awakeEvery[IO](typingRefreshInterval).evalMap { _ =>
+          (composing.get, input.get).flatMapN { (c, inp) =>
+            if c && inp.nonEmpty then outgoingQueue.offer("TYPING") else IO.unit
+          }
+        }
 
       // Trips when no line (chat, PONG, anything) has arrived for deadAfter,
       // turning a silent Azure drop into a clean teardown + nonzero exit so a
@@ -313,22 +411,54 @@ object ChatClient extends IOApp:
           yield ()
         }
 
-      logger.info("Starting chat streams...") >>
-        Stream(serverReader, serverWriter, userReader, pinger, watchdog).parJoinUnbounded
-          .interruptWhen(halt)
-          .compile
-          .drain
-          .handleErrorWith { err =>
-            connectionLost.set(true) *>
-              logger.error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
-          } >>
-        connectionLost.get.flatMap { lost =>
-          if lost then
-            IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
-          else IO.println("Bye!").as(ExitCode.Success)
-        }
+      val streams =
+        Stream(serverReader, serverWriter, userReader, pinger, watchdog, typingRefresher)
+
+      rawMode(term).use { _ =>
+        logger.info("Starting chat streams...") >>
+          ui.refreshInput >>
+          streams.parJoinUnbounded
+            .interruptWhen(halt)
+            .compile
+            .drain
+            .handleErrorWith { err =>
+              connectionLost.set(true) *>
+                logger
+                  .error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
+            } >>
+          connectionLost.get.flatMap { lost =>
+            if lost then
+              IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
+            else IO.println("Bye!").as(ExitCode.Success)
+          }
+      }
     }
   }
+
+  // Names of control lines that must never reach the client log.
+  private def controlNoise(line: String): Boolean =
+    line == "PING" || line == "TYPING" || line == "TYPINGSTOP"
+
+  // Puts the controlling terminal into non-canonical, no-echo mode so we can
+  // observe keystrokes as they happen (for typing indicators) and render the
+  // input line ourselves. Original settings are captured up front and restored
+  // on release, even on crash/cancel. A no-op when we have no TTY.
+  private def rawMode(term: Option[(Int, Int)]): Resource[IO, Unit] =
+    term match
+      case None => Resource.unit[IO]
+      case Some(_) =>
+        Resource
+          .make(
+            IO.blocking(Seq("sh", "-c", "stty -g < /dev/tty").!!.trim)
+              .flatTap(_ =>
+                IO.blocking(Seq("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty").!).void
+              )
+              .handleError(_ => "")
+          )(saved =>
+            if saved.isEmpty then IO.unit
+            else IO.blocking(Seq("sh", "-c", s"stty $saved < /dev/tty").!).attempt.void
+          )
+          .void
 
   private def readFromServer(
       socket: Socket[IO],
@@ -352,6 +482,17 @@ object ChatClient extends IOApp:
           else if msg.startsWith("USERS:") then
             val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setUsers(users)
+          else if msg.startsWith("TYPING:") then
+            // Belt-and-braces: the server already excludes us, but drop our own
+            // name too so we never see ourselves listed as typing.
+            val users = msg
+              .drop(7)
+              .split(",")
+              .map(_.trim)
+              .filter(_.nonEmpty)
+              .filterNot(_.equalsIgnoreCase(myUsername))
+              .toList
+            ui.setTyping(users)
           else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
           else if msg.startsWith("FILEACCEPT:") then
             handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
@@ -413,17 +554,88 @@ object ChatClient extends IOApp:
       outgoingQueue: Queue[IO, String],
       halt: Deferred[IO, Either[Throwable, Unit]],
       state: Ref[IO, ClientState],
-      ui: Ui
+      ui: Ui,
+      input: Ref[IO, String],
+      composing: Ref[IO, Boolean]
   ): Stream[IO, Nothing] =
-    Stream
-      .repeatEval(Console[IO].readLine)
-      .evalMap {
-        case s if s == null || s == "/quit" => halt.complete(Right(())).void
-        case s if s.startsWith("/sendfile ") =>
-          prepareSendFile(s.drop(10), state, outgoingQueue, ui)
-        case s => outgoingQueue.offer(s)
-      }
-      .drain
+    if !ui.isTty then
+      // No TTY (piped/redirected): stay line-based, no typing signals, no
+      // escapes — the terminal still echoes and there is nothing to erase.
+      Stream
+        .repeatEval(Console[IO].readLine)
+        .evalMap {
+          case s if s == null || s == "/quit" => halt.complete(Right(())).void
+          case s if s.startsWith("/sendfile ") =>
+            prepareSendFile(s.drop(10), state, outgoingQueue, ui)
+          case s => outgoingQueue.offer(s)
+        }
+        .drain
+    else
+      // Raw mode: assemble lines from single characters ourselves so we can
+      // observe typing as it happens and render the input line under our
+      // control (echo is off).
+      fs2.io
+        .stdin[IO](64)
+        .through(text.utf8.decode)
+        .flatMap(chunk => Stream.emits(chunk.toList))
+        .evalMap(ch => handleInputChar(ch, outgoingQueue, halt, state, ui, input, composing))
+        .drain
+
+  private def handleInputChar(
+      ch: Char,
+      outgoingQueue: Queue[IO, String],
+      halt: Deferred[IO, Either[Throwable, Unit]],
+      state: Ref[IO, ClientState],
+      ui: Ui,
+      input: Ref[IO, String],
+      composing: Ref[IO, Boolean]
+  ): IO[Unit] =
+    ch match
+      case '\n' | '\r' =>
+        input.getAndSet("").flatMap { line =>
+          ui.refreshInput *>
+            stopTyping(outgoingQueue, composing) *>
+            dispatchLine(line.trim, outgoingQueue, halt, state, ui)
+        }
+      case '\u007f' | '\b' =>
+        input.updateAndGet(s => if s.isEmpty then s else s.dropRight(1)).flatMap { s =>
+          ui.refreshInput *>
+            (if s.isEmpty then stopTyping(outgoingQueue, composing) else IO.unit)
+        }
+      case '\u0004' => // Ctrl-D on an empty prompt behaves like /quit
+        halt.complete(Right(())).void
+      case c if c >= ' ' =>
+        input.update(_ + c) *>
+          ui.refreshInput *>
+          startTyping(outgoingQueue, composing)
+      case _ => IO.unit
+
+  private def dispatchLine(
+      line: String,
+      outgoingQueue: Queue[IO, String],
+      halt: Deferred[IO, Either[Throwable, Unit]],
+      state: Ref[IO, ClientState],
+      ui: Ui
+  ): IO[Unit] =
+    if line.isEmpty then IO.unit
+    else if line == "/quit" then halt.complete(Right(())).void
+    else if line.startsWith("/sendfile ") then
+      prepareSendFile(line.drop(10), state, outgoingQueue, ui)
+    else outgoingQueue.offer(line)
+
+  private def startTyping(
+      outgoingQueue: Queue[IO, String],
+      composing: Ref[IO, Boolean]
+  ): IO[Unit] =
+    composing.getAndSet(true).flatMap(was => if was then IO.unit else outgoingQueue.offer("TYPING"))
+
+  private def stopTyping(
+      outgoingQueue: Queue[IO, String],
+      composing: Ref[IO, Boolean]
+  ): IO[Unit] =
+    composing
+      .getAndSet(false)
+      .flatMap(was => if was then outgoingQueue.offer("TYPINGSTOP") else IO.unit)
 
   private def checkForMentions(line: String, myUsername: String): IO[Unit] =
     val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
