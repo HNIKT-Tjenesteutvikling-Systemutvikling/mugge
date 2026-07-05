@@ -10,6 +10,8 @@ import java.io.IOException
 import scala.sys.process.*
 import scala.concurrent.duration.*
 import java.security.*
+import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.util.Base64
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -22,12 +24,24 @@ object ChatClient extends IOApp:
   private val defaultPort = port"5555"
   private val defaultHost = host"localhost"
 
+  private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
+  private val fileChunkSize = 48 * 1024 // raw bytes per chunk before base64
+
+  // Sender-side: file the local user offered, kept until FILEACCEPT/FILEREJECT.
+  case class OutgoingFile(path: Path, name: String, size: Long)
+
+  // Receiver-side: an accepted offer being streamed in; temp is created lazily
+  // on the first FILEDATA chunk and finalized on FILEEND.
+  case class IncomingFile(from: String, name: String, size: Long, temp: Option[Path] = None)
+
   case class ClientState(
       authenticated: Boolean = false,
       githubUsername: Option[String] = None,
       privateKey: Option[PrivateKey] = None,
       colors: Map[String, Int] = Map.empty,
-      onlineUsers: List[String] = Nil
+      onlineUsers: List[String] = Nil,
+      outgoingFiles: Map[String, OutgoingFile] = Map.empty,
+      incomingFiles: Map[String, IncomingFile] = Map.empty
   )
 
   private val ansiReset = "\u001b[0m"
@@ -262,7 +276,7 @@ object ChatClient extends IOApp:
           .onFinalize(logger.info("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
-        readFromUser(outgoingQueue, halt)
+        readFromUser(outgoingQueue, halt, state, ui)
           .onFinalize(logger.info("User reader stream finished."))
 
       logger.info("Starting chat streams...") >>
@@ -295,6 +309,12 @@ object ChatClient extends IOApp:
         else if msg.startsWith("USERS:") then
           val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
           ui.setUsers(users)
+        else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
+        else if msg.startsWith("FILEACCEPT:") then
+          handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
+        else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
+        else if msg.startsWith("FILEDATA:") then handleFileData(msg, state)
+        else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
         else if msg.contains("Authentication successful!") then
           state.update(_.copy(authenticated = true)) >>
             ui.printLine(msg) >>
@@ -347,13 +367,17 @@ object ChatClient extends IOApp:
 
   private def readFromUser(
       outgoingQueue: Queue[IO, String],
-      halt: Deferred[IO, Either[Throwable, Unit]]
+      halt: Deferred[IO, Either[Throwable, Unit]],
+      state: Ref[IO, ClientState],
+      ui: Ui
   ): Stream[IO, Nothing] =
     Stream
       .repeatEval(Console[IO].readLine)
       .evalMap {
         case s if s == null || s == "/quit" => halt.complete(Right(())).void
-        case s                              => outgoingQueue.offer(s)
+        case s if s.startsWith("/sendfile ") =>
+          prepareSendFile(s.drop(10), state, outgoingQueue, ui)
+        case s => outgoingQueue.offer(s)
       }
       .drain
 
@@ -432,3 +456,216 @@ object ChatClient extends IOApp:
         logger.info(s"[Notification] $title: $body")
     }
   }
+
+  // ---- File transfer -------------------------------------------------------
+
+  // Sender: user typed `/sendfile @user <path>`. Validate locally, then send
+  // the wire form `/sendfile @user <id> <size> <name>` (server can't stat the
+  // file), remembering id -> path until the receiver accepts.
+  private def prepareSendFile(
+      rest: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    rest.trim.split(" ", 2) match
+      case Array(targetToken, rawPath) if targetToken.startsWith("@") =>
+        val path = Paths.get(rawPath.trim)
+        IO.blocking {
+          val regular = Files.isRegularFile(path)
+          val readable = regular && Files.isReadable(path)
+          val size = if regular then Files.size(path) else -1L
+          (Files.exists(path), regular, readable, size)
+        }.attempt
+          .flatMap {
+            case Right((false, _, _, _)) => ui.printLine(s"File not found: $rawPath")
+            case Right((_, false, _, _)) => ui.printLine(s"Not a regular file: $rawPath")
+            case Right((_, _, false, _)) => ui.printLine(s"File is not readable: $rawPath")
+            case Right((_, _, _, s)) if s > maxFileSize =>
+              ui.printLine(s"File too large ($s bytes). Max is $maxFileSize bytes.")
+            case Right((_, _, _, size)) =>
+              val id = java.util.UUID.randomUUID().toString.take(8)
+              val name = path.getFileName.toString
+              state.update(st =>
+                st.copy(outgoingFiles = st.outgoingFiles + (id -> OutgoingFile(path, name, size)))
+              ) *>
+                outgoingQueue.offer(s"/sendfile $targetToken $id $size $name")
+            case Left(err) => ui.printLine(s"Could not read file: ${err.getMessage}")
+          }
+      case _ =>
+        ui.printLine("Usage: /sendfile @user <path>")
+
+  // Receiver: an offer arrived. Remember its metadata and alert the user both
+  // in the chat pane and with a desktop notification.
+  private def handleFileOffer(
+      msg: String,
+      state: Ref[IO, ClientState],
+      ui: Ui
+  ): IO[Unit] =
+    msg.split(":", 5) match
+      case Array(_, id, from, sizeStr, name) =>
+        val size = sizeStr.toLongOption.getOrElse(0L)
+        val safe = sanitizeFilename(name)
+        state.update(st =>
+          st.copy(incomingFiles = st.incomingFiles + (id -> IncomingFile(from, safe, size)))
+        ) *>
+          ui.printLine(
+            s"$from wants to send \"$safe\" ($size bytes). " +
+              s"Accept with /acceptfile $id or decline with /rejectfile $id"
+          ) *>
+          sendNotification(
+            title = s"📎 File offer from $from",
+            body = s"$safe ($size bytes) — /acceptfile $id or /rejectfile $id",
+            urgency = "critical",
+            timeout = 0
+          )
+      case _ => IO.unit
+
+  // Sender: receiver approved; stream the file as base64 FILEDATA chunks then a
+  // FILEEND with the sha256. Run detached so the read loop keeps flowing.
+  private def handleFileAccept(
+      id: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    state
+      .modify(st => (st.copy(outgoingFiles = st.outgoingFiles - id), st.outgoingFiles.get(id)))
+      .flatMap {
+        case Some(out) =>
+          ui.printLine(s"Offer accepted; sending ${out.name}...") *>
+            sendFileData(id, out, outgoingQueue, ui).start.void
+        case None => IO.unit
+      }
+
+  private def sendFileData(
+      id: String,
+      out: OutgoingFile,
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    IO.blocking(Files.readAllBytes(out.path)).attempt.flatMap {
+      case Left(err) =>
+        ui.printLine(s"Failed to read ${out.name}: ${err.getMessage}")
+      case Right(bytes) =>
+        val sha = sha256Hex(bytes)
+        val chunks = bytes.grouped(fileChunkSize).zipWithIndex.toList
+        chunks.traverse_ { case (chunk, seq) =>
+          outgoingQueue.offer(s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(chunk)}")
+        } *>
+          outgoingQueue.offer(s"FILEEND:$id:$sha") *>
+          ui.printLine(s"Sent ${out.name} (${out.size} bytes).")
+    }
+
+  private def handleFileReject(
+      id: String,
+      state: Ref[IO, ClientState],
+      ui: Ui
+  ): IO[Unit] =
+    state
+      .modify(st => (st.copy(outgoingFiles = st.outgoingFiles - id), st.outgoingFiles.get(id)))
+      .flatMap {
+        case Some(out) => ui.printLine(s"${out.name} was rejected by the recipient.")
+        case None      => IO.unit
+      }
+
+  // Receiver: append an incoming chunk to a lazily-created temp file.
+  private def handleFileData(msg: String, state: Ref[IO, ClientState]): IO[Unit] =
+    msg.split(":", 4) match
+      case Array(_, id, _, b64) =>
+        state.get.map(_.incomingFiles.get(id)).flatMap {
+          case None => IO.unit
+          case Some(incoming) =>
+            val bytes = Base64.getDecoder.decode(b64)
+            incoming.temp match
+              case Some(tmp) =>
+                IO.blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND)).void
+              case None =>
+                for
+                  tmp <- IO.blocking(Files.createTempFile("mugge-", ".part"))
+                  _ <- IO.blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND))
+                  _ <- state.update(st =>
+                    st.copy(incomingFiles =
+                      st.incomingFiles.updatedWith(id)(_.map(_.copy(temp = Some(tmp))))
+                    )
+                  )
+                yield ()
+        }
+      case _ => IO.unit
+
+  // Receiver: verify sha256 and move the temp file into the download dir.
+  private def handleFileEnd(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
+    msg.split(":", 3) match
+      case Array(_, id, sha) =>
+        state
+          .modify(st => (st.copy(incomingFiles = st.incomingFiles - id), st.incomingFiles.get(id)))
+          .flatMap {
+            case None => IO.unit
+            case Some(incoming) =>
+              for
+                tmp <- incoming.temp match
+                  case Some(t) => IO.pure(t)
+                  case None    => IO.blocking(Files.createTempFile("mugge-", ".part"))
+                _ <- finalizeIncoming(tmp, sha, incoming, ui)
+              yield ()
+          }
+      case _ => IO.unit
+
+  private def finalizeIncoming(
+      tmp: Path,
+      expectedSha: String,
+      incoming: IncomingFile,
+      ui: Ui
+  ): IO[Unit] =
+    IO.blocking(Files.readAllBytes(tmp)).flatMap { bytes =>
+      if !sha256Hex(bytes).equalsIgnoreCase(expectedSha) then
+        IO.blocking(Files.deleteIfExists(tmp)).attempt.void *>
+          ui.printLine(s"Checksum mismatch for ${incoming.name}; download discarded.")
+      else
+        for
+          dir <- downloadDir
+          _ <- IO.blocking(Files.createDirectories(dir))
+          target <- IO.blocking(uniqueTarget(dir, incoming.name))
+          _ <- IO.blocking(Files.move(tmp, target))
+          _ <- ui.printLine(s"Saved ${incoming.name} from ${incoming.from} to $target")
+          _ <- sendNotification(
+            title = s"📎 File received from ${incoming.from}",
+            body = s"Saved to $target",
+            urgency = "normal"
+          )
+        yield ()
+    }
+
+  private def sha256Hex(bytes: Array[Byte]): String =
+    MessageDigest
+      .getInstance("SHA-256")
+      .digest(bytes)
+      .map(b => f"${b & 0xff}%02x")
+      .mkString
+
+  private def sanitizeFilename(name: String): String =
+    val base = name.replace("\\", "/").split("/").filter(_.nonEmpty).lastOption.getOrElse("file")
+    val cleaned = base.trim
+    if cleaned.isEmpty || cleaned == "." || cleaned == ".." then "file" else cleaned
+
+  private def downloadDir: IO[Path] =
+    IO {
+      sys.env
+        .get("XDG_DOWNLOAD_DIR")
+        .filter(_.nonEmpty)
+        .map(Paths.get(_))
+        .getOrElse(Paths.get(System.getProperty("user.home"), "Downloads"))
+    }
+
+  private def uniqueTarget(dir: Path, name: String): Path =
+    val initial = dir.resolve(name)
+    if !Files.exists(initial) then initial
+    else
+      val dot = name.lastIndexOf('.')
+      val (base, ext) =
+        if dot > 0 then (name.substring(0, dot), name.substring(dot)) else (name, "")
+      Iterator
+        .from(1)
+        .map(i => dir.resolve(s"$base ($i)$ext"))
+        .find(p => !Files.exists(p))
+        .get
