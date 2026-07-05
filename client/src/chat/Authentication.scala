@@ -39,6 +39,7 @@ object Authentication:
     case KristianAN extends AuthorizedUser("KristianAN")
     case Solheim extends AuthorizedUser("5olheim")
     case TurboNaepskrel extends AuthorizedUser("TurboNaepskrel")
+    case LeifEggenfellner extends AuthorizedUser("leifeggenfellner")
 
   case class AuthChallenge(challenge: String, signature: Option[String])
 
