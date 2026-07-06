@@ -34,15 +34,11 @@ object ChatClient extends IOApp:
   private val watchdogInterval = 30.seconds
   private val deadAfter = 3.minutes
 
-  // How often the sender re-asserts TYPING while still composing; must stay
-  // under the server's ~5s typing lease so the indicator doesn't lapse.
+  // Must stay under the server's ~5s typing lease so the indicator doesn't lapse.
   private val typingRefreshInterval = 3.seconds
 
-  // Sender-side: file the local user offered, kept until FILEACCEPT/FILEREJECT.
   case class OutgoingFile(path: Path, name: String, size: Long)
 
-  // Receiver-side: an accepted offer being streamed in; temp is created lazily
-  // on the first FILEDATA chunk and finalized on FILEEND.
   case class IncomingFile(from: String, name: String, size: Long, temp: Option[Path] = None)
 
   case class ClientState(
@@ -58,8 +54,6 @@ object ChatClient extends IOApp:
 
   private val ansiReset = "\u001b[0m"
 
-  // Distinct 256-color foregrounds; assigned per sender in order of first
-  // appearance so concurrent chatters stay visually separated.
   private val ansiPalette: Vector[String] = Vector(
     "\u001b[38;5;39m",
     "\u001b[38;5;208m",
@@ -75,8 +69,6 @@ object ChatClient extends IOApp:
     "\u001b[38;5;213m"
   )
 
-  // Darker twin of each entry in ansiPalette (same index), used for the
-  // message body so a sender's text reads as a weaker shade of their name.
   private val ansiDimPalette: Vector[String] = Vector(
     "\u001b[38;5;25m",
     "\u001b[38;5;130m",
@@ -140,7 +132,6 @@ object ChatClient extends IOApp:
 
   private val inputPrompt = "> "
 
-  // "user1 is typing..." style summary; None when nobody (else) is typing.
   private def formatTyping(users: List[String]): Option[String] =
     users match
       case Nil      => None
@@ -174,22 +165,29 @@ object ChatClient extends IOApp:
       }
 
     def setUsers(users: List[String]): IO[Unit] =
-      state.update(_.copy(onlineUsers = users)) *>
-        mutex.lock.surround {
-          term match
-            case None               => Console[IO].println(s"Online: ${users.mkString(", ")}")
-            case Some((cols, rows)) => render(None, cols, rows)
-        }
+      state.modify(st => (st.copy(onlineUsers = users), st.onlineUsers != users)).flatMap {
+        changed =>
+          if !changed then IO.unit
+          else
+            mutex.lock.surround {
+              term match
+                case None               => Console[IO].println(s"Online: ${users.mkString(", ")}")
+                case Some((cols, rows)) => render(None, cols, rows)
+            }
+      }
 
     def setTyping(users: List[String]): IO[Unit] =
-      state.update(_.copy(typingUsers = users)) *>
-        mutex.lock.surround {
-          term match
-            case None               => IO.unit
-            case Some((cols, rows)) => render(None, cols, rows)
-        }
+      state.modify(st => (st.copy(typingUsers = users), st.typingUsers != users)).flatMap {
+        changed =>
+          if !changed then IO.unit
+          else
+            mutex.lock.surround {
+              term match
+                case None               => IO.unit
+                case Some((cols, rows)) => render(None, cols, rows)
+            }
+      }
 
-    // Repaint the live block after a keystroke (input/typing change).
     def refreshInput: IO[Unit] =
       mutex.lock.surround {
         term match
@@ -197,8 +195,6 @@ object ChatClient extends IOApp:
           case Some((cols, rows)) => render(None, cols, rows)
       }
 
-    // Erase the previously drawn block, optionally emit one chat line above it,
-    // repaint the block, then repaint the panel — as a single write.
     private def render(chat: Option[String], cols: Int, rows: Int): IO[Unit] =
       for
         st <- state.get
@@ -226,8 +222,6 @@ object ChatClient extends IOApp:
         val up = if n > 1 then s"\u001b[${n - 1}A" else ""
         s"\r$up\u001b[0J"
 
-    // The dimmed typing line (if any) plus the prompt+input line. Cursor ends
-    // at the end of the input. Returns the rendered string and its line count.
     private def renderBlock(st: ClientState, inp: String): (String, Int) =
       val typingLine =
         formatTyping(st.typingUsers).map(t => s"\r\u001b[2K\u001b[2m$t$ansiReset\n")
@@ -332,13 +326,15 @@ object ChatClient extends IOApp:
         .map(ghu => s"auto-auth:$ghu")
         .getOrElse("")
       finalString = List(hostname, authData).filter(_.nonEmpty).mkString("\n") + "\n\n"
-      _ <- logger.info(s"Prepared initial data to send.")
+      _ <- logger.debug(s"Prepared initial data to send.")
     } yield finalString
 
     (
       detectTerminal,
       Mutex[IO],
-      Queue.unbounded[IO, String],
+      // Bounded to keep a stuck socket from ballooning memory; offers apply
+      // backpressure (the file-send loop naturally throttles to the socket).
+      Queue.bounded[IO, String](1024),
       Deferred[IO, Either[Throwable, Unit]],
       IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
       Ref.of[IO, Boolean](false),
@@ -363,21 +359,23 @@ object ChatClient extends IOApp:
         (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
           .map(_ + "\n")
           .evalTap {
-            // Heartbeat + typing signals stay invisible client-side.
             case data if controlNoise(data.trim) => IO.unit
-            case data                            => logger.info(s"Writing to server: $data")
+            // Never write secrets or file bytes to the log verbatim.
+            case data if sensitiveOutbound(data.trim) =>
+              logger.debug("Writing to server: <redacted sensitive line>")
+            case data => logger.debug(s"Writing to server: $data")
           }
           .through(text.utf8.encode)
           .through(socket.writes)
-          .onFinalize(logger.info("Server writer stream finished."))
+          .onFinalize(logger.debug("Server writer stream finished."))
 
       val serverReader: Stream[IO, Unit] =
         readFromServer(socket, myUsername, state, outgoingQueue, ui, lastReceived)
-          .onFinalize(logger.info("Server reader stream finished."))
+          .onFinalize(logger.debug("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
         readFromUser(outgoingQueue, halt, state, ui, input, composing)
-          .onFinalize(logger.info("User reader stream finished."))
+          .onFinalize(logger.debug("User reader stream finished."))
 
       val pinger: Stream[IO, Unit] =
         Stream
@@ -415,7 +413,7 @@ object ChatClient extends IOApp:
         Stream(serverReader, serverWriter, userReader, pinger, watchdog, typingRefresher)
 
       rawMode(term).use { _ =>
-        logger.info("Starting chat streams...") >>
+        logger.debug("Starting chat streams...") >>
           ui.refreshInput >>
           streams.parJoinUnbounded
             .interruptWhen(halt)
@@ -438,6 +436,12 @@ object ChatClient extends IOApp:
   // Names of control lines that must never reach the client log.
   private def controlNoise(line: String): Boolean =
     line == "PING" || line == "TYPING" || line == "TYPINGSTOP"
+
+  // Outbound lines whose contents must never be logged verbatim: auth
+  // signatures (challenge-response secret material) and file payloads.
+  private def sensitiveOutbound(line: String): Boolean =
+    line.startsWith("SIGNATURE:") || line.startsWith("/verify ") ||
+      line.startsWith("FILEDATA:") || line.startsWith("FILEEND:")
 
   // Puts the controlling terminal into non-canonical, no-echo mode so we can
   // observe keystrokes as they happen (for typing indicators) and render the
@@ -713,8 +717,6 @@ object ChatClient extends IOApp:
     }
   }
 
-  // ---- File transfer -------------------------------------------------------
-
   // Sender: user typed `/sendfile @user <path>`. Validate locally, then send
   // the wire form `/sendfile @user <id> <size> <name>` (server can't stat the
   // file), remembering id -> path until the receiver accepts.
@@ -751,8 +753,6 @@ object ChatClient extends IOApp:
       case _ =>
         ui.printLine("Usage: /sendfile @user <path>")
 
-  // Receiver: an offer arrived. Remember its metadata and alert the user both
-  // in the chat pane and with a desktop notification.
   private def handleFileOffer(
       msg: String,
       state: Ref[IO, ClientState],
@@ -777,8 +777,7 @@ object ChatClient extends IOApp:
           )
       case _ => IO.unit
 
-  // Sender: receiver approved; stream the file as base64 FILEDATA chunks then a
-  // FILEEND with the sha256. Run detached so the read loop keeps flowing.
+  // Run detached (via `.start`) so the server read loop keeps flowing while sending.
   private def handleFileAccept(
       id: String,
       state: Ref[IO, ClientState],
@@ -825,7 +824,6 @@ object ChatClient extends IOApp:
         case None      => IO.unit
       }
 
-  // Receiver: append an incoming chunk to a lazily-created temp file.
   private def handleFileData(msg: String, state: Ref[IO, ClientState]): IO[Unit] =
     msg.split(":", 4) match
       case Array(_, id, _, b64) =>
@@ -849,7 +847,6 @@ object ChatClient extends IOApp:
         }
       case _ => IO.unit
 
-  // Receiver: verify sha256 and move the temp file into the download dir.
   private def handleFileEnd(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
     msg.split(":", 3) match
       case Array(_, id, sha) =>
