@@ -5,6 +5,7 @@ import cats.effect.std.{Console, Mutex, Queue}
 import cats.syntax.all.*
 import fs2.*
 import fs2.io.net.*
+import fs2.io.file.{Files as Fs2Files, Path as Fs2Path}
 import com.comcast.ip4s.*
 import java.io.IOException
 import scala.sys.process.*
@@ -21,7 +22,7 @@ object ChatClient extends IOApp:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]
   given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
 
-  private val defaultPort = port"5555"
+  private val defaultPort = port"20222"
   private val defaultHost = host"localhost"
 
   private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
@@ -88,6 +89,13 @@ object ChatClient extends IOApp:
 
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
+
+  // True only for a genuine server-authored line (clientId == SERVER); guards
+  // the auth-success interception so a user can't spoof it by typing the phrase.
+  private def isFromServer(msg: String): Boolean =
+    msg match
+      case displayPattern(_, _, sender, _) => sender.trim == "SERVER"
+      case _                               => false
 
   private def colorIndexFor(name: String, state: Ref[IO, ClientState]): IO[Int] =
     state.modify { st =>
@@ -269,18 +277,23 @@ object ChatClient extends IOApp:
         case Some(ghu) => logger.debug(s"Detected GitHub username: $ghu")
         case None      => logger.error("Could not detect GitHub username from git config")
 
+      // Trust-all: the server presents an ephemeral self-signed cert, so there
+      // is nothing to validate — this only encrypts the transport.
+      tlsContext <- Network[IO].tlsContext.insecure
       exitCode <- Network[IO]
         .client(SocketAddress(host, port))
-        .use { socket =>
-          for
-            _ <- IO.println(s"Connected to chat server at $host:$port")
-            state <- Ref.of[IO, ClientState](
-              ClientState(
-                githubUsername = githubUsername
+        .use { rawSocket =>
+          tlsContext.client(rawSocket).use { socket =>
+            for
+              _ <- IO.println(s"Connected to chat server at $host:$port")
+              state <- Ref.of[IO, ClientState](
+                ClientState(
+                  githubUsername = githubUsername
+                )
               )
-            )
-            code <- handleConnection(socket, myUsername, state)
-          yield code
+              code <- handleConnection(socket, myUsername, state)
+            yield code
+          }
         }
         .handleErrorWith {
           case _: IOException =>
@@ -503,7 +516,7 @@ object ChatClient extends IOApp:
           else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
           else if msg.startsWith("FILEDATA:") then handleFileData(msg, state)
           else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
-          else if msg.contains("Authentication successful!") then
+          else if isFromServer(msg) && msg.contains("Authentication successful!") then
             state.update(_.copy(authenticated = true)) >>
               ui.printLine(msg) >>
               ui.printLine("You can now start chatting!")
@@ -793,23 +806,31 @@ object ChatClient extends IOApp:
         case None => IO.unit
       }
 
+  // Stream the file from disk in fixed-size chunks (bounded memory even for a
+  // 10 MiB file), base64-ing each and folding a running SHA-256, rather than
+  // reading the whole file into memory. Backpressure comes from the bounded
+  // outgoing queue.
   private def sendFileData(
       id: String,
       out: OutgoingFile,
       outgoingQueue: Queue[IO, String],
       ui: Ui
   ): IO[Unit] =
-    IO.blocking(Files.readAllBytes(out.path)).attempt.flatMap {
-      case Left(err) =>
-        ui.printLine(s"Failed to read ${out.name}: ${err.getMessage}")
-      case Right(bytes) =>
-        val sha = sha256Hex(bytes)
-        val chunks = bytes.grouped(fileChunkSize).zipWithIndex.toList
-        chunks.traverse_ { case (chunk, seq) =>
-          outgoingQueue.offer(s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(chunk)}")
-        } *>
-          outgoingQueue.offer(s"FILEEND:$id:$sha") *>
-          ui.printLine(s"Sent ${out.name} (${out.size} bytes).")
+    IO(MessageDigest.getInstance("SHA-256")).flatMap { md =>
+      Fs2Files[IO]
+        .readAll(Fs2Path.fromNioPath(out.path))
+        .chunkN(fileChunkSize)
+        .zipWithIndex
+        .evalMap { case (chunk, seq) =>
+          val bytes = chunk.toArray
+          IO(md.update(bytes)) *>
+            outgoingQueue.offer(s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(bytes)}")
+        }
+        .compile
+        .drain
+        .flatMap(_ => outgoingQueue.offer(s"FILEEND:$id:${toHex(md.digest())}"))
+        .flatMap(_ => ui.printLine(s"Sent ${out.name} (${out.size} bytes)."))
+        .handleErrorWith(err => ui.printLine(s"Failed to send ${out.name}: ${err.getMessage}"))
     }
 
   private def handleFileReject(
@@ -870,8 +891,8 @@ object ChatClient extends IOApp:
       incoming: IncomingFile,
       ui: Ui
   ): IO[Unit] =
-    IO.blocking(Files.readAllBytes(tmp)).flatMap { bytes =>
-      if !sha256Hex(bytes).equalsIgnoreCase(expectedSha) then
+    streamSha256(tmp).flatMap { actualSha =>
+      if !actualSha.equalsIgnoreCase(expectedSha) then
         IO.blocking(Files.deleteIfExists(tmp)).attempt.void *>
           ui.printLine(s"Checksum mismatch for ${incoming.name}; download discarded.")
       else
@@ -889,12 +910,20 @@ object ChatClient extends IOApp:
         yield ()
     }
 
-  private def sha256Hex(bytes: Array[Byte]): String =
-    MessageDigest
-      .getInstance("SHA-256")
-      .digest(bytes)
-      .map(b => f"${b & 0xff}%02x")
-      .mkString
+  private def toHex(bytes: Array[Byte]): String =
+    bytes.map(b => f"${b & 0xff}%02x").mkString
+
+  // Fold a SHA-256 over the file on disk in chunks, without loading it wholesale.
+  private def streamSha256(path: Path): IO[String] =
+    IO(MessageDigest.getInstance("SHA-256")).flatMap { md =>
+      Fs2Files[IO]
+        .readAll(Fs2Path.fromNioPath(path))
+        .chunks
+        .evalMap(c => IO(md.update(c.toArray)))
+        .compile
+        .drain
+        .map(_ => toHex(md.digest()))
+    }
 
   private def sanitizeFilename(name: String): String =
     val base = name.replace("\\", "/").split("/").filter(_.nonEmpty).lastOption.getOrElse("file")

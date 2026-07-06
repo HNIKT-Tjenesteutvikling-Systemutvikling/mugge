@@ -132,7 +132,7 @@ rec {
       exec ${clientBuild}/bin/mugge-client "$@"
     else
       HOST=''${CHAT_SERVER_HOST:-localhost}
-      PORT=''${CHAT_SERVER_PORT:-5555}
+      PORT=''${CHAT_SERVER_PORT:-20222}
       
       echo -e "''${YELLOW}Connecting to: ''${HOST}:''${PORT}''${NC}"
       echo -e "''${GREEN}Tip: Set CHAT_SERVER_HOST and CHAT_SERVER_PORT to change defaults''${NC}"
@@ -146,7 +146,7 @@ rec {
     #!${pkgs.bash}/bin/bash
 
     AZURE_HOST="mugge-chat-server.norwayeast.azurecontainer.io"
-    AZURE_PORT="5555"
+    AZURE_PORT="20222"
 
     echo "🌐 Connecting to Azure Container Instance..."
     echo "   Server: $AZURE_HOST:$AZURE_PORT"
