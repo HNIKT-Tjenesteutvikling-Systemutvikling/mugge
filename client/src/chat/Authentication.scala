@@ -6,6 +6,7 @@ import cats.data.EitherT
 import java.security.*
 import java.security.spec.*
 import java.util.Base64
+import java.nio.ByteBuffer
 import java.nio.file.{Files, Paths, LinkOption}
 import scala.sys.process.*
 import org.typelevel.log4cats.LoggerFactory
@@ -108,7 +109,7 @@ object Authentication:
     else "Unknown"
 
   private def parsePrivateKey(path: String, keyString: String): EitherT[IO, AuthError, PrivateKey] =
-    if keyString.contains("BEGIN OPENSSH PRIVATE KEY") then convertOpenSSHKey(keyString)
+    if keyString.contains("BEGIN OPENSSH PRIVATE KEY") then parseOpenSSHKey(keyString)
     else if keyString.contains("BEGIN RSA PRIVATE KEY") then parsePKCS1Key(keyString)
     else if keyString.contains("BEGIN PRIVATE KEY") then
       EitherT.fromEither[IO] {
@@ -128,9 +129,71 @@ object Authentication:
       }
     else if keyString.contains("BEGIN EC PRIVATE KEY") then
       EitherT.fromEither[IO](
-        Left(KeyLoadError("EC keys are not supported. Please use an RSA key."))
+        Left(KeyLoadError("EC keys are not supported. Please use an RSA or ed25519 key."))
       )
     else EitherT.fromEither[IO](Left(KeyLoadError(s"Unknown key format in $path")))
+
+  // PKCS8 DER prefix for an Ed25519 private key (RFC 8410); the raw 32-byte
+  // seed goes right after it.
+  private val ed25519Pkcs8Prefix: Array[Byte] =
+    Array(0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+      0x20).map(_.toByte)
+
+  private def parseOpenSSHKey(keyString: String): EitherT[IO, AuthError, PrivateKey] =
+    EitherT(IO.blocking(decodeOpenSSHEd25519Seed(keyString))).flatMap {
+      case Some(seed) => EitherT.fromEither[IO](ed25519PrivateFromSeed(seed))
+      case None       => convertOpenSSHKey(keyString)
+    }
+
+  // Some(seed) for an unencrypted ed25519 key; None for other key types
+  // (which go through the ssh-keygen RSA conversion instead); Left for a
+  // passphrase-protected ed25519 key (ssh-keygen cannot convert those to a
+  // JVM-readable format, so we parse the openssh-key-v1 container directly).
+  private def decodeOpenSSHEd25519Seed(keyString: String): Either[AuthError, Option[Array[Byte]]] =
+    Either
+      .catchNonFatal {
+        val body = keyString.linesIterator.filterNot(_.startsWith("-----")).mkString.trim
+        val bytes = Base64.getDecoder.decode(body)
+        val magic = "openssh-key-v1\u0000".getBytes("US-ASCII")
+        if !bytes.startsWith(magic) then throw new Exception("missing openssh-key-v1 magic")
+
+        def readChunk(b: ByteBuffer): Array[Byte] =
+          val arr = new Array[Byte](b.getInt())
+          val _ = b.get(arr)
+          arr
+
+        val buf = ByteBuffer.wrap(bytes, magic.length, bytes.length - magic.length)
+        val cipher = new String(readChunk(buf), "US-ASCII")
+        val _ = readChunk(buf) // kdf name
+        val _ = readChunk(buf) // kdf options
+        val keyCount = buf.getInt()
+        if keyCount != 1 then throw new Exception(s"expected 1 key in container, got $keyCount")
+
+        val pubBuf = ByteBuffer.wrap(readChunk(buf))
+        val keyType = new String(readChunk(pubBuf), "US-ASCII")
+        if keyType != "ssh-ed25519" then None
+        else if cipher != "none" then
+          throw new Exception(
+            "ed25519 key is passphrase-protected; auto-auth needs an unencrypted key"
+          )
+        else
+          val priv = ByteBuffer.wrap(readChunk(buf))
+          val _ = priv.getInt() // check int 1
+          val _ = priv.getInt() // check int 2
+          val _ = readChunk(priv) // key type, again
+          val _ = readChunk(priv) // public key (32 bytes)
+          // private part is seed (32 bytes) ++ public key (32 bytes)
+          Some(readChunk(priv).take(32))
+      }
+      .leftMap(e => KeyParseError(s"Failed to parse OpenSSH key: ${e.getMessage}"))
+
+  private def ed25519PrivateFromSeed(seed: Array[Byte]): Either[AuthError, PrivateKey] =
+    Either
+      .catchNonFatal {
+        val keySpec = new PKCS8EncodedKeySpec(ed25519Pkcs8Prefix ++ seed)
+        KeyFactory.getInstance("Ed25519").generatePrivate(keySpec)
+      }
+      .leftMap(e => KeyParseError(s"Failed to build Ed25519 private key: ${e.getMessage}"))
 
   private def convertOpenSSHKey(
       keyString: String
@@ -216,7 +279,10 @@ object Authentication:
       .fromEither[IO] {
         Either
           .catchNonFatal {
-            val signature = Signature.getInstance("SHA256withRSA")
+            val algorithm = privateKey match
+              case _: java.security.interfaces.EdECPrivateKey => "Ed25519"
+              case _                                          => "SHA256withRSA"
+            val signature = Signature.getInstance(algorithm)
             signature.initSign(privateKey)
             signature.update(challenge.getBytes("UTF-8"))
             val signatureBytes = signature.sign()
