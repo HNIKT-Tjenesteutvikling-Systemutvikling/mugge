@@ -1,8 +1,9 @@
-{ pkgs
-, src
-, customJava
-, bleep
-, ...
+{
+  pkgs,
+  src,
+  customJava,
+  bleep,
+  ...
 }:
 rec {
   bleepDepsCache = pkgs.stdenv.mkDerivation {

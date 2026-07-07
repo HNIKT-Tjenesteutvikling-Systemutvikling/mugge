@@ -98,7 +98,7 @@
             };
           };
 
-          formatter = pkgs.nixfmt-rfc-style;
+          formatter = pkgs.nixfmt;
 
           checks = {
             pre-commit-check = pre-commit-lib.run {
@@ -107,7 +107,7 @@
                 statix.enable = true;
                 deadnix.enable = true;
                 nil.enable = true;
-                nixpkgs-fmt.enable = true;
+                nixfmt-rfc-style.enable = true;
                 shellcheck.enable = true;
                 beautysh.enable = true;
               };
