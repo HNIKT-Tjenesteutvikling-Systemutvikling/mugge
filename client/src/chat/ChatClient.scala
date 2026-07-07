@@ -25,6 +25,11 @@ object ChatClient extends IOApp:
   private val defaultPort = port"20222"
   private val defaultHost = host"localhost"
 
+  // Wire-protocol version sent to the server on connect. Bump in BOTH repos
+  // when a change makes older clients incompatible; the server refuses any
+  // client below its required minimum with an update-and-rebuild message.
+  private val protocolVersion = 1
+
   private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
   private val fileChunkSize = 48 * 1024 // raw bytes per chunk before base64
 
@@ -50,7 +55,8 @@ object ChatClient extends IOApp:
       onlineUsers: List[String] = Nil,
       typingUsers: List[String] = Nil,
       outgoingFiles: Map[String, OutgoingFile] = Map.empty,
-      incomingFiles: Map[String, IncomingFile] = Map.empty
+      incomingFiles: Map[String, IncomingFile] = Map.empty,
+      pingHistory: Map[String, List[FiniteDuration]] = Map.empty
   )
 
   private val ansiReset = "\u001b[0m"
@@ -133,7 +139,9 @@ object ChatClient extends IOApp:
         .map { out =>
           out.split("\\s+").toList match
             case rows :: cols :: Nil =>
-              (cols.toIntOption, rows.toIntOption).tupled
+              // 0x0 => a headless pty (e.g. dtach -N with no client attached);
+              // treat as no-TTY so we fall back to plain-line mode.
+              (cols.toIntOption, rows.toIntOption).tupled.filter((c, r) => c > 0 && r > 0)
             case _ => None
         }
         .handleError(_ => None)
@@ -338,7 +346,9 @@ object ChatClient extends IOApp:
         .filter(_ => privateKey.isDefined)
         .map(ghu => s"auto-auth:$ghu")
         .getOrElse("")
-      finalString = List(hostname, authData).filter(_.nonEmpty).mkString("\n") + "\n\n"
+      finalString = List(hostname, s"proto:$protocolVersion", authData)
+        .filter(_.nonEmpty)
+        .mkString("\n") + "\n\n"
       _ <- logger.debug(s"Prepared initial data to send.")
     } yield finalString
 
@@ -351,6 +361,7 @@ object ChatClient extends IOApp:
       Deferred[IO, Either[Throwable, Unit]],
       IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
       Ref.of[IO, Boolean](false),
+      Ref.of[IO, Boolean](false),
       Ref.of[IO, String](""),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Int](0)
@@ -362,6 +373,7 @@ object ChatClient extends IOApp:
         halt,
         lastReceived,
         connectionLost,
+        incompatible,
         input,
         composing,
         blockLines
@@ -383,7 +395,16 @@ object ChatClient extends IOApp:
           .onFinalize(logger.debug("Server writer stream finished."))
 
       val serverReader: Stream[IO, Unit] =
-        readFromServer(socket, myUsername, state, outgoingQueue, ui, lastReceived)
+        readFromServer(
+          socket,
+          myUsername,
+          state,
+          outgoingQueue,
+          ui,
+          lastReceived,
+          halt,
+          incompatible
+        )
           .onFinalize(logger.debug("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
@@ -437,8 +458,9 @@ object ChatClient extends IOApp:
                 logger
                   .error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
             } >>
-          connectionLost.get.flatMap { lost =>
-            if lost then
+          (connectionLost.get, incompatible.get).flatMapN { (lost, incompat) =>
+            if incompat then IO.pure(ExitCode.Error) // server already printed guidance
+            else if lost then
               IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
             else IO.println("Bye!").as(ExitCode.Success)
           }
@@ -483,7 +505,9 @@ object ChatClient extends IOApp:
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String],
       ui: Ui,
-      lastReceived: Ref[IO, FiniteDuration]
+      lastReceived: Ref[IO, FiniteDuration],
+      halt: Deferred[IO, Either[Throwable, Unit]],
+      incompatible: Ref[IO, Boolean]
   ): Stream[IO, Nothing] =
     socket.reads
       .through(text.utf8.decode)
@@ -492,6 +516,12 @@ object ChatClient extends IOApp:
       .evalMap { msg =>
         IO.monotonic.flatMap(lastReceived.set) *> {
           if msg == "PONG" then IO.unit
+          else if msg.startsWith("INCOMPATIBLE:") then
+            // Server refused us on version grounds; it already includes the
+            // update-and-rebuild guidance. Show it and tear down cleanly.
+            incompatible.set(true) *>
+              ui.printLine(msg.drop("INCOMPATIBLE:".length)) *>
+              halt.complete(Right(())).void
           else if msg.startsWith("CHALLENGE:") then
             handleAutoChallenge(msg.drop(10), state, outgoingQueue)
           else if msg.startsWith("Challenge: ") then
@@ -523,7 +553,7 @@ object ChatClient extends IOApp:
           else
             colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
               checkForMentions(msg, myUsername) >>
-              checkForPings(msg, myUsername)
+              checkForPings(msg, myUsername, state)
         }
       }
       .drain
@@ -674,20 +704,40 @@ object ChatClient extends IOApp:
       case _ =>
         IO.unit
 
-  private def checkForPings(line: String, myUsername: String): IO[Unit] =
+  // Per-sender ping allowance: at most maxPingsPerWindow notifications from a
+  // given sender within pingWindow, after which that sender is muted until the
+  // window rolls off. Stops a `!ping @me 1000` from flooding the tray.
+  private val maxPingsPerWindow = 3
+  private val pingWindow = 5.minutes
+
+  private def checkForPings(
+      line: String,
+      myUsername: String,
+      state: Ref[IO, ClientState]
+  ): IO[Unit] =
     val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
     val pingPattern = """^!ping\s+@(\w+)(?:\s+(\d+))?""".r
 
     line match
       case messagePattern(time, sender, content) =>
         content match
-          case pingPattern(targetUser, countStr) =>
-            if targetUser.equalsIgnoreCase(myUsername) then
-              val count = Option(countStr).flatMap(_.toIntOption).getOrElse(1)
-              val limitedCount = count.min(10).max(1)
-
-              sendMultiplePings(sender, time, limitedCount)
-            else IO.unit
+          case pingPattern(targetUser, countStr) if targetUser.equalsIgnoreCase(myUsername) =>
+            val requested = Option(countStr).flatMap(_.toIntOption).getOrElse(1).max(1)
+            IO.monotonic.flatMap { now =>
+              state
+                .modify { st =>
+                  val recent = st.pingHistory
+                    .getOrElse(sender, Nil)
+                    .filter(t => now - t < pingWindow)
+                  val allowed = (maxPingsPerWindow - recent.size).max(0).min(requested)
+                  val updated = recent ++ List.fill(allowed)(now)
+                  (st.copy(pingHistory = st.pingHistory.updated(sender, updated)), allowed)
+                }
+                .flatMap { allowed =>
+                  if allowed <= 0 then IO.unit
+                  else sendMultiplePings(sender, time, allowed)
+                }
+            }
           case _ => IO.unit
       case _ =>
         IO.unit

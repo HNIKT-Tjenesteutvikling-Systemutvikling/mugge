@@ -13,6 +13,12 @@
     inputs:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" ];
+
+      flake.homeManagerModules = rec {
+        mugge-chat = import ./nix/hm-module.nix inputs.self;
+        default = mugge-chat;
+      };
+
       perSystem =
         { pkgs, system, ... }:
         let
