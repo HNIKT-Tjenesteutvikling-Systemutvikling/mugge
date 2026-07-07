@@ -119,6 +119,17 @@ rec {
       ]
     }:$PATH
 
+    # Voice chat: the JVM's javax.sound.sampled backend dlopen()s libasound at
+    # runtime, and alsa-plugins provides the PCM that routes ALSA's `default`
+    # device to the user's PipeWire/Pulse session. Without these on NixOS the
+    # /voice command can't open the mic or speaker.
+    export LD_LIBRARY_PATH=${
+      pkgs.lib.makeLibraryPath [
+        pkgs.alsa-lib
+        pkgs.alsa-plugins
+      ]
+    }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
     GREEN='\033[0;32m'
     BLUE='\033[0;34m'
     YELLOW='\033[1;33m'

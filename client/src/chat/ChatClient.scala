@@ -28,7 +28,7 @@ object ChatClient extends IOApp:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  private val protocolVersion = 1
+  private val protocolVersion = 2
 
   // Set by the systemd user service (task 8). In this mode the client is a
   // shared background process, so /quit must NOT exit (that would kill the
@@ -67,8 +67,15 @@ object ChatClient extends IOApp:
       typingUsers: List[String] = Nil,
       outgoingFiles: Map[String, OutgoingFile] = Map.empty,
       incomingFiles: Map[String, IncomingFile] = Map.empty,
-      pingHistory: Map[String, List[FiniteDuration]] = Map.empty
+      pingHistory: Map[String, List[FiniteDuration]] = Map.empty,
+      inVoice: Boolean = false,
+      muted: Boolean = false,
+      voiceUsers: List[String] = Nil
   )
+
+  // Live voice session: the Audio handle plus a fully-releasing teardown
+  // (cancel capture/playback fibers, close the mic and speaker lines).
+  private case class Voice(handle: Audio.Handle, teardown: IO[Unit])
 
   private val ansiReset = "\u001b[0m"
 
@@ -202,6 +209,18 @@ object ChatClient extends IOApp:
             }
       }
 
+    def setVoiceUsers(users: List[String]): IO[Unit] =
+      state.modify(st => (st.copy(voiceUsers = users), st.voiceUsers != users)).flatMap { changed =>
+        if !changed then IO.unit
+        else
+          mutex.lock.surround {
+            termSize.get.flatMap {
+              case None               => IO.unit
+              case Some((cols, rows)) => render(None, cols, rows)
+            }
+          }
+      }
+
     def setTyping(users: List[String]): IO[Unit] =
       state.modify(st => (st.copy(typingUsers = users), st.typingUsers != users)).flatMap {
         changed =>
@@ -245,7 +264,9 @@ object ChatClient extends IOApp:
         _ = sb.append(eraseBlock(prev))
         _ = chat.foreach(l => sb.append(l).append("\n"))
         _ = sb.append(blockStr)
-        _ = sb.append(panelStr(colored, st.onlineUsers.size, startCol, clearRows))
+        _ = sb.append(
+          panelStr(colored, st.voiceUsers.toSet, st.onlineUsers.size, startCol, clearRows)
+        )
         _ <- Console[IO].print(sb.toString)
         _ <- blockLines.set(newCount)
       yield ()
@@ -265,6 +286,7 @@ object ChatClient extends IOApp:
 
     private def panelStr(
         colored: List[(String, String)],
+        voice: Set[String],
         total: Int,
         startCol: Int,
         clearRows: Int
@@ -273,8 +295,9 @@ object ChatClient extends IOApp:
         (1 to clearRows).map(r => s"\u001b[$r;${startCol}H" + " " * panelWidth).mkString
       val header = s"\u001b[1;${startCol}H\u001b[1m\u2524 Online ($total)\u001b[0m"
       val entries = colored.zipWithIndex.map { case ((u, color), i) =>
+        val bullet = if voice.contains(u) then "\u266a" else "\u2022"
         val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
-        s"\u001b[${2 + i};${startCol}H$color\u2022 $name$ansiReset"
+        s"\u001b[${2 + i};${startCol}H$color$bullet $name$ansiReset"
       }.mkString
       // \u001b7 save cursor+attrs, \u001b8 restore.
       s"\u001b7$clears$header$entries\u001b8"
@@ -384,7 +407,8 @@ object ChatClient extends IOApp:
       Ref.of[IO, String](""),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Int](0),
-      Ref.of[IO, Option[(Int, Int)]](None)
+      Ref.of[IO, Option[(Int, Int)]](None),
+      Ref.of[IO, Option[Voice]](None)
     ).tupled.flatMap { tup =>
       val (
         initialSize,
@@ -398,7 +422,8 @@ object ChatClient extends IOApp:
         input,
         composing,
         blockLines,
-        termSize
+        termSize,
+        voiceRef
       ) = tup
       val ui = new Ui(mutex, state, input, blockLines, pty, termSize)
 
@@ -425,12 +450,13 @@ object ChatClient extends IOApp:
           ui,
           lastReceived,
           halt,
-          incompatible
+          incompatible,
+          voiceRef
         )
           .onFinalize(logger.debug("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
-        readFromUser(outgoingQueue, halt, state, ui, input, composing)
+        readFromUser(outgoingQueue, halt, state, ui, input, composing, voiceRef)
           .onFinalize(logger.debug("User reader stream finished."))
 
       val pinger: Stream[IO, Unit] =
@@ -500,6 +526,7 @@ object ChatClient extends IOApp:
             .interruptWhen(halt)
             .compile
             .drain
+            .guarantee(voiceRef.getAndSet(None).flatMap(_.traverse_(_.teardown)))
             .handleErrorWith { err =>
               connectionLost.set(true) *>
                 logger
@@ -517,7 +544,8 @@ object ChatClient extends IOApp:
 
   // Names of control lines that must never reach the client log.
   private def controlNoise(line: String): Boolean =
-    line == "PING" || line == "TYPING" || line == "TYPINGSTOP"
+    line == "PING" || line == "TYPING" || line == "TYPINGSTOP" ||
+      line == "VOICEJOIN" || line == "VOICELEAVE" || line.startsWith("VOICE:")
 
   // Outbound lines whose contents must never be logged verbatim: auth
   // signatures (challenge-response secret material) and file payloads.
@@ -553,7 +581,8 @@ object ChatClient extends IOApp:
       ui: Ui,
       lastReceived: Ref[IO, FiniteDuration],
       halt: Deferred[IO, Either[Throwable, Unit]],
-      incompatible: Ref[IO, Boolean]
+      incompatible: Ref[IO, Boolean],
+      voiceRef: Ref[IO, Option[Voice]]
   ): Stream[IO, Nothing] =
     socket.reads
       .through(text.utf8.decode)
@@ -586,6 +615,17 @@ object ChatClient extends IOApp:
               .filterNot(_.equalsIgnoreCase(myUsername))
               .toList
             ui.setTyping(users)
+          else if msg.startsWith("VOICEUSERS:") then
+            val users =
+              msg.drop("VOICEUSERS:".length).split(",").map(_.trim).filter(_.nonEmpty).toList
+            ui.setVoiceUsers(users)
+          else if msg.startsWith("VOICE:") then
+            // VOICE:<from>:<seq>:<base64-pcm> — decode into the sender's jitter
+            // buffer; dropped silently if we've since left voice.
+            msg.split(":", 4) match
+              case Array(_, from, _, b64) =>
+                voiceRef.get.flatMap(_.traverse_(_.handle.receive(from, b64)))
+              case _ => IO.unit
           else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
           else if msg.startsWith("FILEACCEPT:") then
             handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
@@ -649,7 +689,8 @@ object ChatClient extends IOApp:
       state: Ref[IO, ClientState],
       ui: Ui,
       input: Ref[IO, String],
-      composing: Ref[IO, Boolean]
+      composing: Ref[IO, Boolean],
+      voiceRef: Ref[IO, Option[Voice]]
   ): Stream[IO, Nothing] =
     if !ui.isTty then
       // No TTY (piped/redirected): stay line-based, no typing signals, no
@@ -657,12 +698,8 @@ object ChatClient extends IOApp:
       Stream
         .repeatEval(Console[IO].readLine)
         .evalMap {
-          case s if s == null         => halt.complete(Right(())).void
-          case "/quit" if serviceMode => ui.printLine(quitHint)
-          case "/quit"                => halt.complete(Right(())).void
-          case s if s.startsWith("/sendfile ") =>
-            prepareSendFile(s.drop(10), state, outgoingQueue, ui)
-          case s => outgoingQueue.offer(s)
+          case s if s == null => halt.complete(Right(())).void
+          case s              => dispatchLine(s.trim, outgoingQueue, halt, state, ui, voiceRef)
         }
         .drain
     else
@@ -673,7 +710,9 @@ object ChatClient extends IOApp:
         .stdin[IO](64)
         .through(text.utf8.decode)
         .flatMap(chunk => Stream.emits(chunk.toList))
-        .evalMap(ch => handleInputChar(ch, outgoingQueue, halt, state, ui, input, composing))
+        .evalMap(ch =>
+          handleInputChar(ch, outgoingQueue, halt, state, ui, input, composing, voiceRef)
+        )
         .drain
 
   private def handleInputChar(
@@ -683,14 +722,15 @@ object ChatClient extends IOApp:
       state: Ref[IO, ClientState],
       ui: Ui,
       input: Ref[IO, String],
-      composing: Ref[IO, Boolean]
+      composing: Ref[IO, Boolean],
+      voiceRef: Ref[IO, Option[Voice]]
   ): IO[Unit] =
     ch match
       case '\n' | '\r' =>
         input.getAndSet("").flatMap { line =>
           ui.refreshInput *>
             stopTyping(outgoingQueue, composing) *>
-            dispatchLine(line.trim, outgoingQueue, halt, state, ui)
+            dispatchLine(line.trim, outgoingQueue, halt, state, ui, voiceRef)
         }
       case '\u007f' | '\b' =>
         input.updateAndGet(s => if s.isEmpty then s else s.dropRight(1)).flatMap { s =>
@@ -710,14 +750,110 @@ object ChatClient extends IOApp:
       outgoingQueue: Queue[IO, String],
       halt: Deferred[IO, Either[Throwable, Unit]],
       state: Ref[IO, ClientState],
-      ui: Ui
+      ui: Ui,
+      voiceRef: Ref[IO, Option[Voice]]
   ): IO[Unit] =
     if line.isEmpty then IO.unit
     else if line == "/quit" then
       if serviceMode then ui.printLine(quitHint) else halt.complete(Right(())).void
     else if line.startsWith("/sendfile ") then
       prepareSendFile(line.drop(10), state, outgoingQueue, ui)
+    else if line == "/voice" then toggleVoice(state, outgoingQueue, ui, voiceRef)
+    else if line == "/voicetest" then toggleVoiceTest(state, outgoingQueue, ui, voiceRef)
+    else if line == "/mute" then toggleMute(state, ui, voiceRef)
     else outgoingQueue.offer(line)
+
+  private def toggleVoice(
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui,
+      voiceRef: Ref[IO, Option[Voice]]
+  ): IO[Unit] =
+    voiceRef.get.flatMap {
+      case Some(_) => stopVoice(state, outgoingQueue, ui, voiceRef)
+      case None    => startVoice(state, outgoingQueue, ui, voiceRef, loopback = false)
+    }
+
+  // Local self-test: no server involved. Captured frames are fed straight back
+  // into our own playback path, so a single user can confirm the mic, speaker,
+  // VOX, encode/decode and mixing all work by hearing themselves.
+  private def toggleVoiceTest(
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui,
+      voiceRef: Ref[IO, Option[Voice]]
+  ): IO[Unit] =
+    voiceRef.get.flatMap {
+      case Some(_) => stopVoice(state, outgoingQueue, ui, voiceRef)
+      case None    => startVoice(state, outgoingQueue, ui, voiceRef, loopback = true)
+    }
+
+  private def startVoice(
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui,
+      voiceRef: Ref[IO, Option[Voice]],
+      loopback: Boolean
+  ): IO[Unit] =
+    Audio.open(state.get.map(_.muted)).allocated.attempt.flatMap {
+      case Left(err) =>
+        ui.printLine(
+          s"Voice unavailable: ${Option(err.getMessage).getOrElse(err.toString)}. Staying in text mode."
+        )
+      case Right((handle, release)) =>
+        for
+          seq <- Ref.of[IO, Int](0)
+          captureFib <- handle.frames
+            .evalMap { b64 =>
+              if loopback then handle.receive("you (test)", b64)
+              else seq.getAndUpdate(_ + 1).flatMap(n => outgoingQueue.offer(s"VOICE:$n:$b64"))
+            }
+            .compile
+            .drain
+            .start
+          playbackFib <- handle.playback.compile.drain.start
+          teardown = playbackFib.cancel *> release *> captureFib.cancel
+          _ <- voiceRef.set(Some(Voice(handle, teardown)))
+          _ <- state.update(_.copy(inVoice = true, muted = false))
+          _ <- if loopback then IO.unit else outgoingQueue.offer("VOICEJOIN")
+          _ <- ui.printLine(
+            if loopback then
+              "Voice self-test on. Speak and you should hear yourself back. " +
+                "Use headphones (open speakers will feed back). /mute or /voicetest to stop."
+            else
+              "Joined voice. Use headphones to avoid echo. /mute toggles your mic, /voice leaves."
+          )
+        yield ()
+    }
+
+  private def stopVoice(
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui,
+      voiceRef: Ref[IO, Option[Voice]]
+  ): IO[Unit] =
+    voiceRef.getAndSet(None).flatMap {
+      case None => IO.unit
+      case Some(voice) =>
+        state.update(_.copy(inVoice = false, muted = false, voiceUsers = Nil)) *>
+          outgoingQueue.offer("VOICELEAVE") *>
+          voice.teardown *>
+          ui.setVoiceUsers(Nil) *>
+          ui.printLine("Left voice.")
+    }
+
+  private def toggleMute(
+      state: Ref[IO, ClientState],
+      ui: Ui,
+      voiceRef: Ref[IO, Option[Voice]]
+  ): IO[Unit] =
+    voiceRef.get.flatMap {
+      case None => ui.printLine("You're not in voice. Join with /voice first.")
+      case Some(_) =>
+        state
+          .updateAndGet(st => st.copy(muted = !st.muted))
+          .flatMap(st => ui.printLine(if st.muted then "Mic muted." else "Mic unmuted."))
+    }
 
   private def startTyping(
       outgoingQueue: Queue[IO, String],
