@@ -30,6 +30,17 @@ object ChatClient extends IOApp:
   // client below its required minimum with an update-and-rebuild message.
   private val protocolVersion = 1
 
+  // Set by the systemd user service (task 8). In this mode the client is a
+  // shared background process, so /quit must NOT exit (that would kill the
+  // service for everyone). Leaving a terminal is a dtach action the client
+  // can't perform itself, so we point the user at it instead.
+  private val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
+
+  private val quitHint =
+    "/quit is disabled here — this chat runs in the background. Press Ctrl-\\ " +
+      "(or just close the terminal) to leave without disconnecting. To stop it " +
+      "entirely: systemctl --user stop mugge-chat"
+
   private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
   private val fileChunkSize = 48 * 1024 // raw bytes per chunk before base64
 
@@ -611,7 +622,9 @@ object ChatClient extends IOApp:
       Stream
         .repeatEval(Console[IO].readLine)
         .evalMap {
-          case s if s == null || s == "/quit" => halt.complete(Right(())).void
+          case s if s == null         => halt.complete(Right(())).void
+          case "/quit" if serviceMode => ui.printLine(quitHint)
+          case "/quit"                => halt.complete(Right(())).void
           case s if s.startsWith("/sendfile ") =>
             prepareSendFile(s.drop(10), state, outgoingQueue, ui)
           case s => outgoingQueue.offer(s)
@@ -650,7 +663,7 @@ object ChatClient extends IOApp:
             (if s.isEmpty then stopTyping(outgoingQueue, composing) else IO.unit)
         }
       case '\u0004' => // Ctrl-D on an empty prompt behaves like /quit
-        halt.complete(Right(())).void
+        if serviceMode then ui.printLine(quitHint) else halt.complete(Right(())).void
       case c if c >= ' ' =>
         input.update(_ + c) *>
           ui.refreshInput *>
@@ -665,7 +678,8 @@ object ChatClient extends IOApp:
       ui: Ui
   ): IO[Unit] =
     if line.isEmpty then IO.unit
-    else if line == "/quit" then halt.complete(Right(())).void
+    else if line == "/quit" then
+      if serviceMode then ui.printLine(quitHint) else halt.complete(Right(())).void
     else if line.startsWith("/sendfile ") then
       prepareSendFile(line.drop(10), state, outgoingQueue, ui)
     else outgoingQueue.offer(line)
