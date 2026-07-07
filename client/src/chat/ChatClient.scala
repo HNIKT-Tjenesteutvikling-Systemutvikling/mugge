@@ -167,28 +167,25 @@ object ChatClient extends IOApp:
         val init = users.init.mkString(", ")
         Some(s"$init and ${users.last} is typing...")
 
-  // Owns all terminal output. On a TTY it keeps a "live block" pinned at the
-  // bottom — an optional dimmed typing-status line plus the prompt+input line —
-  // that is erased and repainted around every incoming chat line, so the user's
-  // in-progress input survives other people's messages and, crucially, the typed
-  // text is cleared on Enter (the server echo is the only copy that remains).
-  // All writes are serialized through the mutex so nothing interleaves
-  // mid-escape. Without a TTY it degrades to plain lines (no panel, no input
-  // rendering, no escapes).
   final class Ui(
       mutex: Mutex[IO],
       state: Ref[IO, ClientState],
       input: Ref[IO, String],
       blockLines: Ref[IO, Int],
-      term: Option[(Int, Int)]
+      pty: Boolean,
+      termSize: Ref[IO, Option[(Int, Int)]]
   ):
-    def isTty: Boolean = term.isDefined
+    def isTty: Boolean = pty
+
+    private def plainPrint(line: String): IO[Unit] =
+      if pty then Console[IO].print(line + "\r\n") else Console[IO].println(line)
 
     def printLine(line: String): IO[Unit] =
       mutex.lock.surround {
-        term match
-          case None               => Console[IO].println(line)
+        termSize.get.flatMap {
+          case None               => plainPrint(line)
           case Some((cols, rows)) => render(Some(line), cols, rows)
+        }
       }
 
     def setUsers(users: List[String]): IO[Unit] =
@@ -197,9 +194,11 @@ object ChatClient extends IOApp:
           if !changed then IO.unit
           else
             mutex.lock.surround {
-              term match
-                case None               => Console[IO].println(s"Online: ${users.mkString(", ")}")
+              termSize.get.flatMap {
+                case None if pty        => IO.unit
+                case None               => plainPrint(s"Online: ${users.mkString(", ")}")
                 case Some((cols, rows)) => render(None, cols, rows)
+              }
             }
       }
 
@@ -209,17 +208,27 @@ object ChatClient extends IOApp:
           if !changed then IO.unit
           else
             mutex.lock.surround {
-              term match
+              termSize.get.flatMap {
                 case None               => IO.unit
                 case Some((cols, rows)) => render(None, cols, rows)
+              }
             }
       }
 
     def refreshInput: IO[Unit] =
       mutex.lock.surround {
-        term match
+        termSize.get.flatMap {
           case None               => IO.unit
           case Some((cols, rows)) => render(None, cols, rows)
+        }
+      }
+
+    def onResize: IO[Unit] =
+      mutex.lock.surround {
+        termSize.get.flatMap {
+          case None               => IO.unit
+          case Some((cols, rows)) => blockLines.set(0) *> render(None, cols, rows)
+        }
       }
 
     private def render(chat: Option[String], cols: Int, rows: Int): IO[Unit] =
@@ -241,8 +250,6 @@ object ChatClient extends IOApp:
         _ <- blockLines.set(newCount)
       yield ()
 
-    // Move from the end of the input line to the top-left of the block and
-    // clear everything below; returns the cursor to the block's origin.
     private def eraseBlock(n: Int): String =
       if n <= 0 then ""
       else
@@ -256,8 +263,6 @@ object ChatClient extends IOApp:
       val count = (if typingLine.isDefined then 1 else 0) + 1
       (typingLine.getOrElse("") + inputLine, count)
 
-    // The right-hand online-users panel, save/restore-wrapped so it never moves
-    // the block cursor. Rendered last so a bottom-line scroll can't smear it.
     private def panelStr(
         colored: List[(String, String)],
         total: Int,
@@ -365,6 +370,9 @@ object ChatClient extends IOApp:
 
     (
       detectTerminal,
+      // Fixed for the process: is our stdout backed by a terminal device at
+      // all? (Under the dtach service this stays true even while headless.)
+      IO(System.console() != null),
       Mutex[IO],
       // Bounded to keep a stuck socket from ballooning memory; offers apply
       // backpressure (the file-send loop naturally throttles to the socket).
@@ -375,10 +383,12 @@ object ChatClient extends IOApp:
       Ref.of[IO, Boolean](false),
       Ref.of[IO, String](""),
       Ref.of[IO, Boolean](false),
-      Ref.of[IO, Int](0)
+      Ref.of[IO, Int](0),
+      Ref.of[IO, Option[(Int, Int)]](None)
     ).tupled.flatMap { tup =>
       val (
-        term,
+        initialSize,
+        pty,
         mutex,
         outgoingQueue,
         halt,
@@ -387,9 +397,10 @@ object ChatClient extends IOApp:
         incompatible,
         input,
         composing,
-        blockLines
+        blockLines,
+        termSize
       ) = tup
-      val ui = new Ui(mutex, state, input, blockLines, term)
+      val ui = new Ui(mutex, state, input, blockLines, pty, termSize)
 
       val serverWriter: Stream[IO, Nothing] =
         (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
@@ -454,11 +465,36 @@ object ChatClient extends IOApp:
           yield ()
         }
 
-      val streams =
-        Stream(serverReader, serverWriter, userReader, pinger, watchdog, typingRefresher)
+      // Window size isn't fixed: under the dtach-based service the pty starts
+      // headless (0x0) and only gains real dimensions when someone runs `mugge`
+      // to attach. Poll for that transition so the online-users panel and inline
+      // input rendering come to life on attach (and fold back to plain output on
+      // detach). Pointless without a pty in the first place.
+      val terminalWatcher: Stream[IO, Unit] =
+        if !pty then Stream.empty.covary[IO]
+        else
+          Stream.awakeEvery[IO](1.second).evalMap { _ =>
+            detectTerminal.flatMap { latest =>
+              termSize.getAndSet(latest).flatMap { previous =>
+                if previous == latest then IO.unit else ui.onResize
+              }
+            }
+          }
 
-      rawMode(term).use { _ =>
-        logger.debug("Starting chat streams...") >>
+      val streams =
+        Stream(
+          serverReader,
+          serverWriter,
+          userReader,
+          pinger,
+          watchdog,
+          typingRefresher,
+          terminalWatcher
+        )
+
+      rawMode(pty).use { _ =>
+        termSize.set(initialSize) >>
+          logger.debug("Starting chat streams...") >>
           ui.refreshInput >>
           streams.parJoinUnbounded
             .interruptWhen(halt)
@@ -493,22 +529,21 @@ object ChatClient extends IOApp:
   // observe keystrokes as they happen (for typing indicators) and render the
   // input line ourselves. Original settings are captured up front and restored
   // on release, even on crash/cancel. A no-op when we have no TTY.
-  private def rawMode(term: Option[(Int, Int)]): Resource[IO, Unit] =
-    term match
-      case None => Resource.unit[IO]
-      case Some(_) =>
-        Resource
-          .make(
-            IO.blocking(Seq("sh", "-c", "stty -g < /dev/tty").!!.trim)
-              .flatTap(_ =>
-                IO.blocking(Seq("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty").!).void
-              )
-              .handleError(_ => "")
-          )(saved =>
-            if saved.isEmpty then IO.unit
-            else IO.blocking(Seq("sh", "-c", s"stty $saved < /dev/tty").!).attempt.void
-          )
-          .void
+  private def rawMode(pty: Boolean): Resource[IO, Unit] =
+    if !pty then Resource.unit[IO]
+    else
+      Resource
+        .make(
+          IO.blocking(Seq("sh", "-c", "stty -g < /dev/tty").!!.trim)
+            .flatTap(_ =>
+              IO.blocking(Seq("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty").!).void
+            )
+            .handleError(_ => "")
+        )(saved =>
+          if saved.isEmpty then IO.unit
+          else IO.blocking(Seq("sh", "-c", s"stty $saved < /dev/tty").!).attempt.void
+        )
+        .void
 
   private def readFromServer(
       socket: Socket[IO],
