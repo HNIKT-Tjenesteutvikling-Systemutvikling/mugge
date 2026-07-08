@@ -54,6 +54,13 @@ object ChatClient extends IOApp:
   // Must stay under the server's ~5s typing lease so the indicator doesn't lapse.
   private val typingRefreshInterval = 3.seconds
 
+  // Wall-clock gap beyond the watchdog interval that we read as a resume from
+  // suspend (the scheduler's monotonic clock freezes across a suspend).
+  private val suspendGraceThreshold = 30.seconds
+
+  private val reconnectInitialBackoff = 2.seconds
+  private val reconnectMaxBackoff = 30.seconds
+
   case class OutgoingFile(path: Path, name: String, size: Long)
 
   case class IncomingFile(from: String, name: String, size: Long, temp: Option[Path] = None)
@@ -76,6 +83,9 @@ object ChatClient extends IOApp:
   // Live voice session: the Audio handle plus a fully-releasing teardown
   // (cancel capture/playback fibers, close the mic and speaker lines).
   private case class Voice(handle: Audio.Handle, teardown: IO[Unit])
+
+  private enum SessionOutcome:
+    case Quit, Incompatible, Lost, ConnectFailed
 
   private val ansiReset = "\u001b[0m"
 
@@ -327,7 +337,7 @@ object ChatClient extends IOApp:
       // Trust-all: the server presents an ephemeral self-signed cert, so there
       // is nothing to validate — this only encrypts the transport.
       tlsContext <- Network[IO].tlsContext.insecure
-      exitCode <- Network[IO]
+      connectOnce = Network[IO]
         .client(SocketAddress(host, port))
         .use { rawSocket =>
           tlsContext.client(rawSocket).use { socket =>
@@ -338,17 +348,43 @@ object ChatClient extends IOApp:
                   githubUsername = githubUsername
                 )
               )
-              code <- handleConnection(socket, myUsername, state)
-            yield code
+              outcome <- handleConnection(socket, myUsername, state)
+            yield outcome
           }
         }
         .handleErrorWith {
           case _: IOException =>
-            logger.error(s"Failed to connect to server at $host:$port") *> IO(ExitCode.Error)
+            logger
+              .error(s"Failed to connect to server at $host:$port")
+              .as(SessionOutcome.ConnectFailed)
           case err =>
-            logger.error(s"Error: ${err.getMessage}") *> IO(ExitCode.Error)
+            logger.error(s"Error: ${err.getMessage}").as(SessionOutcome.ConnectFailed)
         }
+      exitCode <- reconnectLoop(connectOnce, reconnectInitialBackoff)
     yield exitCode
+
+  // Only the background service reconnects; a foreground client exits on a drop.
+  private def reconnectLoop(
+      connectOnce: IO[SessionOutcome],
+      backoff: FiniteDuration
+  ): IO[ExitCode] =
+    connectOnce.flatMap {
+      case SessionOutcome.Quit         => IO.println("Bye!").as(ExitCode.Success)
+      case SessionOutcome.Incompatible => IO.pure(ExitCode.Error)
+      case SessionOutcome.Lost =>
+        if !serviceMode then
+          IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
+        else
+          IO.println("Connection lost — reconnecting...") *>
+            IO.sleep(reconnectInitialBackoff) *>
+            reconnectLoop(connectOnce, reconnectInitialBackoff)
+      case SessionOutcome.ConnectFailed =>
+        if !serviceMode then IO.pure(ExitCode.Error)
+        else
+          IO.println(s"Reconnecting in ${backoff.toSeconds}s...") *>
+            IO.sleep(backoff) *>
+            reconnectLoop(connectOnce, (backoff * 2).min(reconnectMaxBackoff))
+    }
 
   private def getHostname: IO[String] =
     sys.env.get("MUGGE_HOSTNAME") match
@@ -364,7 +400,7 @@ object ChatClient extends IOApp:
       socket: Socket[IO],
       myUsername: String,
       state: Ref[IO, ClientState]
-  ): IO[ExitCode] = {
+  ): IO[SessionOutcome] = {
     val initialDataIO: IO[String] = for {
       hostname <- getHostname
       currentState <- state.get
@@ -402,6 +438,7 @@ object ChatClient extends IOApp:
       Queue.bounded[IO, String](1024),
       Deferred[IO, Either[Throwable, Unit]],
       IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
+      IO.realTime.flatMap(t => Ref.of[IO, FiniteDuration](t)),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, String](""),
@@ -417,6 +454,7 @@ object ChatClient extends IOApp:
         outgoingQueue,
         halt,
         lastReceived,
+        lastWatchdogWall,
         connectionLost,
         incompatible,
         input,
@@ -481,9 +519,16 @@ object ChatClient extends IOApp:
         Stream.awakeEvery[IO](watchdogInterval).evalMap { _ =>
           for
             now <- IO.monotonic
+            wall <- IO.realTime
             last <- lastReceived.get
+            prevWall <- lastWatchdogWall.getAndSet(wall)
+            resumed = (wall - prevWall) > (watchdogInterval + suspendGraceThreshold)
             _ <-
-              if (now - last) > deadAfter then
+              if resumed then
+                connectionLost.set(true) *>
+                  ui.printLine("Resumed from suspend — reconnecting...") *>
+                  halt.complete(Right(())).void
+              else if (now - last) > deadAfter then
                 connectionLost.set(true) *>
                   ui.printLine("Connection lost: no response from server.") *>
                   halt.complete(Right(())).void
@@ -532,11 +577,10 @@ object ChatClient extends IOApp:
                 logger
                   .error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
             } >>
-          (connectionLost.get, incompatible.get).flatMapN { (lost, incompat) =>
-            if incompat then IO.pure(ExitCode.Error) // server already printed guidance
-            else if lost then
-              IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
-            else IO.println("Bye!").as(ExitCode.Success)
+          (connectionLost.get, incompatible.get).mapN { (lost, incompat) =>
+            if incompat then SessionOutcome.Incompatible
+            else if lost then SessionOutcome.Lost
+            else SessionOutcome.Quit
           }
       }
     }
