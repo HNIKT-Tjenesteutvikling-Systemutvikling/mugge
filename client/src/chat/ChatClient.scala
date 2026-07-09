@@ -13,6 +13,7 @@ import scala.concurrent.duration.*
 import java.security.*
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import java.util.Base64
+import scala.jdk.CollectionConverters.*
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -28,7 +29,7 @@ object ChatClient extends IOApp:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  private val protocolVersion = 2
+  private val protocolVersion = 3
 
   // Set by the systemd user service (task 8). In this mode the client is a
   // shared background process, so /quit must NOT exit (that would kill the
@@ -43,6 +44,12 @@ object ChatClient extends IOApp:
 
   private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
   private val fileChunkSize = 48 * 1024 // raw bytes per chunk before base64
+
+  private val maxPasteLines = 100
+  private val maxPasteChars = 8 * 1024
+  // Must stay under the server's chat bucket refill (3 lines/s after a burst
+  // of 15) or the tail of a long paste is silently rate-limit-dropped.
+  private val pasteLineDelay = 400.milliseconds
 
   // Application-level heartbeat: keeps the TCP flow non-idle so Azure's load
   // balancer (~4 min idle drop) never silently kills a quiet connection, and
@@ -63,7 +70,22 @@ object ChatClient extends IOApp:
 
   case class OutgoingFile(path: Path, name: String, size: Long)
 
-  case class IncomingFile(from: String, name: String, size: Long, temp: Option[Path] = None)
+  case class IncomingFile(
+      from: String,
+      name: String,
+      size: Long,
+      temp: Option[Path] = None,
+      received: Long = 0
+  )
+
+  // Quartile just crossed by going from prev to now bytes (25/50/75), if any;
+  // 100% is covered by the existing completion message.
+  private def progressMilestone(prev: Long, now: Long, total: Long): Option[Int] =
+    if total <= 0 then None
+    else
+      val p = (prev * 4 / total).toInt
+      val n = (now * 4 / total).toInt
+      if n > p && n < 4 then Some(n * 25) else None
 
   case class ClientState(
       authenticated: Boolean = false,
@@ -120,6 +142,35 @@ object ChatClient extends IOApp:
   )
 
   private val serverColor = "\u001b[38;5;245m"
+
+  // Wraps on display cells: ANSI escape sequences are zero-width and never
+  // split; SGR state carries across physical rows on its own.
+  private def wrapAnsi(s: String, width: Int): List[String] =
+    val rows = List.newBuilder[String]
+    val row = new StringBuilder
+    var cells = 0
+    var i = 0
+    while i < s.length do
+      if s.charAt(i) == '\u001b' then
+        val start = i
+        i += 1
+        if i < s.length && s.charAt(i) == '[' then
+          i += 1
+          while i < s.length && (s.charAt(i) < '@' || s.charAt(i) > '~') do i += 1
+          if i < s.length then i += 1
+        else if i < s.length then i += 1
+        row.append(s.substring(start, i))
+      else
+        if cells == width then
+          rows += row.result()
+          row.setLength(0)
+          cells = 0
+        val n = Character.charCount(s.codePointAt(i))
+        row.append(s.substring(i, i + n))
+        cells += 1
+        i += n
+    rows += row.result()
+    rows.result()
 
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
@@ -184,10 +235,48 @@ object ChatClient extends IOApp:
         val init = users.init.mkString(", ")
         Some(s"$init and ${users.last} is typing...")
 
+  private enum InputToken:
+    case Ch(c: Char)
+    case PasteStart, PasteEnd
+
+  private enum EscState:
+    case Ground, Esc
+    case Csi(params: String)
+
+  // Folds the raw char stream into tokens: bracketed-paste markers surface as
+  // tokens, all other escape sequences (arrow keys etc.) are swallowed.
+  private def tokenize(chars: Stream[IO, Char]): Stream[IO, InputToken] =
+    chars
+      .mapAccumulate(EscState.Ground: EscState) { (st, c) =>
+        st match
+          case EscState.Ground =>
+            if c == '\u001b' then (EscState.Esc, Nil)
+            else (EscState.Ground, List(InputToken.Ch(c)))
+          case EscState.Esc =>
+            if c == '[' then (EscState.Csi(""), Nil) else (EscState.Ground, Nil)
+          case EscState.Csi(params) =>
+            if c >= '@' && c <= '~' then
+              val tok = (params, c) match
+                case ("200", '~') => List(InputToken.PasteStart)
+                case ("201", '~') => List(InputToken.PasteEnd)
+                case _            => Nil
+              (EscState.Ground, tok)
+            else (EscState.Csi(params + c), Nil)
+      }
+      .flatMap((_, toks) => Stream.emits(toks))
+
+  final case class InputCtl(
+      text: Ref[IO, String],
+      hint: Ref[IO, Option[String]],
+      pendingPaste: Ref[IO, Option[String]],
+      paste: Ref[IO, Option[(List[Char], Int)]],
+      composing: Ref[IO, Boolean]
+  )
+
   final class Ui(
       mutex: Mutex[IO],
       state: Ref[IO, ClientState],
-      input: Ref[IO, String],
+      ictl: InputCtl,
       blockLines: Ref[IO, Int],
       pty: Boolean,
       termSize: Ref[IO, Option[(Int, Int)]]
@@ -263,16 +352,19 @@ object ChatClient extends IOApp:
     private def render(chat: Option[String], cols: Int, rows: Int): IO[Unit] =
       for
         st <- state.get
-        inp <- input.get
+        inp <- ictl.text.get
+        paste <- ictl.pendingPaste.get
+        hint <- ictl.hint.get
         prev <- blockLines.get
         startCol = math.max(1, cols - panelWidth + 1)
+        textWidth = math.max(1, startCol - 1)
         clearRows = math.min(rows - 1, 30)
         visible = st.onlineUsers.take(math.max(0, clearRows - 1))
         colored <- visible.traverse(u => colorIndexFor(u, state).map(idx => (u, ansiPalette(idx))))
-        (blockStr, newCount) = renderBlock(st, inp)
+        (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
         sb = new StringBuilder
         _ = sb.append(eraseBlock(prev))
-        _ = chat.foreach(l => sb.append(l).append("\n"))
+        _ = chat.foreach(l => wrapAnsi(l, textWidth).foreach(r => sb.append(r).append("\n")))
         _ = sb.append(blockStr)
         _ = sb.append(
           panelStr(colored, st.voiceUsers.toSet, st.onlineUsers.size, startCol, clearRows)
@@ -287,12 +379,24 @@ object ChatClient extends IOApp:
         val up = if n > 1 then s"\u001b[${n - 1}A" else ""
         s"\r$up\u001b[0J"
 
-    private def renderBlock(st: ClientState, inp: String): (String, Int) =
-      val typingLine =
-        formatTyping(st.typingUsers).map(t => s"\r\u001b[2K\u001b[2m$t$ansiReset\n")
-      val inputLine = s"\r\u001b[2K$inputPrompt$inp"
-      val count = (if typingLine.isDefined then 1 else 0) + 1
-      (typingLine.getOrElse("") + inputLine, count)
+    private def renderBlock(
+        st: ClientState,
+        inp: String,
+        paste: Option[String],
+        hint: Option[String],
+        width: Int,
+        rows: Int
+    ): (String, Int) =
+      def dim(s: String) = s"\u001b[2m${wrapAnsi(s, width).head}$ansiReset"
+      val hintRow = hint.map(dim)
+      val typingRow = formatTyping(st.typingUsers).map(dim)
+      val pasteTag =
+        paste.fold("")(p => s"\u001b[2m[paste: ${p.count(_ == '\n') + 1} lines]$ansiReset")
+      // Tail-follow when the input is taller than the screen.
+      val inputRows =
+        wrapAnsi(inputPrompt + inp + pasteTag, width).takeRight(math.max(1, rows - 2))
+      val all = hintRow.toList ++ typingRow.toList ++ inputRows
+      (all.map(r => s"\r\u001b[2K$r").mkString("\n"), all.size)
 
     private def panelStr(
         colored: List[(String, String)],
@@ -445,7 +549,10 @@ object ChatClient extends IOApp:
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Int](0),
       Ref.of[IO, Option[(Int, Int)]](None),
-      Ref.of[IO, Option[Voice]](None)
+      Ref.of[IO, Option[Voice]](None),
+      Ref.of[IO, Option[String]](None),
+      Ref.of[IO, Option[String]](None),
+      Ref.of[IO, Option[(List[Char], Int)]](None)
     ).tupled.flatMap { tup =>
       val (
         initialSize,
@@ -461,9 +568,13 @@ object ChatClient extends IOApp:
         composing,
         blockLines,
         termSize,
-        voiceRef
+        voiceRef,
+        hint,
+        pendingPaste,
+        pasteBuf
       ) = tup
-      val ui = new Ui(mutex, state, input, blockLines, pty, termSize)
+      val ictl = InputCtl(input, hint, pendingPaste, pasteBuf, composing)
+      val ui = new Ui(mutex, state, ictl, blockLines, pty, termSize)
 
       val serverWriter: Stream[IO, Nothing] =
         (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
@@ -494,7 +605,7 @@ object ChatClient extends IOApp:
           .onFinalize(logger.debug("Server reader stream finished."))
 
       val userReader: Stream[IO, Unit] =
-        readFromUser(outgoingQueue, halt, state, ui, input, composing, voiceRef)
+        readFromUser(outgoingQueue, halt, state, ui, ictl, voiceRef)
           .onFinalize(logger.debug("User reader stream finished."))
 
       val pinger: Stream[IO, Unit] =
@@ -547,7 +658,12 @@ object ChatClient extends IOApp:
           Stream.awakeEvery[IO](1.second).evalMap { _ =>
             detectTerminal.flatMap { latest =>
               termSize.getAndSet(latest).flatMap { previous =>
-                if previous == latest then IO.unit else ui.onResize
+                if previous == latest then IO.unit
+                else
+                  // A newly-attached terminal (dtach) never saw the startup
+                  // enable, so re-assert bracketed paste on attach.
+                  (if previous.isEmpty && latest.isDefined then Console[IO].print("\u001b[?2004h")
+                   else IO.unit) *> ui.onResize
               }
             }
           }
@@ -610,10 +726,12 @@ object ChatClient extends IOApp:
             .flatTap(_ =>
               IO.blocking(Seq("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty").!).void
             )
+            .flatTap(_ => Console[IO].print("\u001b[?2004h"))
             .handleError(_ => "")
         )(saved =>
-          if saved.isEmpty then IO.unit
-          else IO.blocking(Seq("sh", "-c", s"stty $saved < /dev/tty").!).attempt.void
+          Console[IO].print("\u001b[?2004l").attempt.void *>
+            (if saved.isEmpty then IO.unit
+             else IO.blocking(Seq("sh", "-c", s"stty $saved < /dev/tty").!).attempt.void)
         )
         .void
 
@@ -674,7 +792,7 @@ object ChatClient extends IOApp:
           else if msg.startsWith("FILEACCEPT:") then
             handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
           else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
-          else if msg.startsWith("FILEDATA:") then handleFileData(msg, state)
+          else if msg.startsWith("FILEDATA:") then handleFileData(msg, state, ui)
           else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
           else if isFromServer(msg) && msg.contains("Authentication successful!") then
             state.update(_.copy(authenticated = true)) >>
@@ -732,8 +850,7 @@ object ChatClient extends IOApp:
       halt: Deferred[IO, Either[Throwable, Unit]],
       state: Ref[IO, ClientState],
       ui: Ui,
-      input: Ref[IO, String],
-      composing: Ref[IO, Boolean],
+      ictl: InputCtl,
       voiceRef: Ref[IO, Option[Voice]]
   ): Stream[IO, Nothing] =
     if !ui.isTty then
@@ -750,14 +867,67 @@ object ChatClient extends IOApp:
       // Raw mode: assemble lines from single characters ourselves so we can
       // observe typing as it happens and render the input line under our
       // control (echo is off).
-      fs2.io
-        .stdin[IO](64)
-        .through(text.utf8.decode)
-        .flatMap(chunk => Stream.emits(chunk.toList))
-        .evalMap(ch =>
-          handleInputChar(ch, outgoingQueue, halt, state, ui, input, composing, voiceRef)
-        )
+      tokenize(
+        fs2.io
+          .stdin[IO](64)
+          .through(text.utf8.decode)
+          .flatMap(chunk => Stream.emits(chunk.toList))
+      )
+        .evalMap(tok => handleToken(tok, outgoingQueue, halt, state, ui, ictl, voiceRef))
         .drain
+
+  private def handleToken(
+      tok: InputToken,
+      outgoingQueue: Queue[IO, String],
+      halt: Deferred[IO, Either[Throwable, Unit]],
+      state: Ref[IO, ClientState],
+      ui: Ui,
+      ictl: InputCtl,
+      voiceRef: Ref[IO, Option[Voice]]
+  ): IO[Unit] =
+    tok match
+      case InputToken.PasteStart => ictl.paste.set(Some((Nil, 0)))
+      case InputToken.PasteEnd   => finishPaste(outgoingQueue, ui, ictl)
+      case InputToken.Ch(c) =>
+        ictl.paste.get.flatMap {
+          case Some(_) =>
+            val ch = if c == '\r' then '\n' else c
+            if ch == '\n' || ch == '\t' || ch >= ' ' then
+              ictl.paste.update(_.map { (cs, n) =>
+                if n < maxPasteChars then (ch :: cs, n + 1) else (cs, n + 1)
+              })
+            else IO.unit
+          case None => handleInputChar(c, outgoingQueue, halt, state, ui, ictl, voiceRef)
+        }
+
+  private def finishPaste(
+      outgoingQueue: Queue[IO, String],
+      ui: Ui,
+      ictl: InputCtl
+  ): IO[Unit] =
+    ictl.paste.getAndSet(None).flatMap {
+      case None => IO.unit
+      case Some((cs, n)) =>
+        val text = cs.reverse.mkString.stripSuffix("\n")
+        val lines = text.count(_ == '\n') + 1
+        if n > maxPasteChars || lines > maxPasteLines then
+          ui.printLine(
+            s"Paste dropped: too large (max $maxPasteChars chars / $maxPasteLines lines)."
+          )
+        else if !text.contains('\n') then
+          ictl.text.update(_ + text) *>
+            ui.refreshInput *>
+            startTyping(outgoingQueue, ictl.composing)
+        else
+          ictl.pendingPaste.set(Some(text)) *>
+            ui.refreshInput *>
+            startTyping(outgoingQueue, ictl.composing)
+    }
+
+  private def sendPasteBlock(text: String, outgoingQueue: Queue[IO, String]): IO[Unit] =
+    val lines = text.split("\n", -1).toList
+    val block = s"[paste — ${lines.size} lines]" :: lines.map("│ " + _)
+    block.traverse_(l => outgoingQueue.offer(l) *> IO.sleep(pasteLineDelay)).start.void
 
   private def handleInputChar(
       ch: Char,
@@ -765,29 +935,128 @@ object ChatClient extends IOApp:
       halt: Deferred[IO, Either[Throwable, Unit]],
       state: Ref[IO, ClientState],
       ui: Ui,
-      input: Ref[IO, String],
-      composing: Ref[IO, Boolean],
+      ictl: InputCtl,
       voiceRef: Ref[IO, Option[Voice]]
   ): IO[Unit] =
     ch match
       case '\n' | '\r' =>
-        input.getAndSet("").flatMap { line =>
-          ui.refreshInput *>
-            stopTyping(outgoingQueue, composing) *>
-            dispatchLine(line.trim, outgoingQueue, halt, state, ui, voiceRef)
-        }
+        (ictl.text.getAndSet(""), ictl.pendingPaste.getAndSet(None), ictl.hint.getAndSet(None))
+          .flatMapN { (line, paste, _) =>
+            ui.refreshInput *>
+              stopTyping(outgoingQueue, ictl.composing) *>
+              dispatchLine(line.trim, outgoingQueue, halt, state, ui, voiceRef) *>
+              paste.traverse_(sendPasteBlock(_, outgoingQueue))
+          }
+      case '\t' =>
+        completeInput(state, ui, ictl)
       case '\u007f' | '\b' =>
-        input.updateAndGet(s => if s.isEmpty then s else s.dropRight(1)).flatMap { s =>
-          ui.refreshInput *>
-            (if s.isEmpty then stopTyping(outgoingQueue, composing) else IO.unit)
-        }
+        ictl.hint.set(None) *>
+          ictl.pendingPaste.getAndSet(None).flatMap {
+            case Some(_) => ui.refreshInput // Backspace discards a pending paste first
+            case None =>
+              ictl.text
+                .updateAndGet { s =>
+                  if s.isEmpty then s
+                  else s.dropRight(if Character.isLowSurrogate(s.last) then 2 else 1)
+                }
+                .flatMap { s =>
+                  ui.refreshInput *>
+                    (if s.isEmpty then stopTyping(outgoingQueue, ictl.composing) else IO.unit)
+                }
+          }
       case '\u0004' => // Ctrl-D on an empty prompt behaves like /quit
         if serviceMode then ui.printLine(quitHint) else halt.complete(Right(())).void
       case c if c >= ' ' =>
-        input.update(_ + c) *>
+        ictl.hint.set(None) *>
+          ictl.text.update(_ + c) *>
           ui.refreshInput *>
-          startTyping(outgoingQueue, composing)
+          startTyping(outgoingQueue, ictl.composing)
       case _ => IO.unit
+
+  // Hand-mirrors the server's commandHelp; keep in sync when commands change.
+  private val clientCommands = List(
+    "/acceptfile",
+    "/auth",
+    "/ban",
+    "/help",
+    "/kick",
+    "/mute",
+    "/quit",
+    "/rejectfile",
+    "/sendfile",
+    "/verify",
+    "/voice",
+    "/voicetest"
+  )
+
+  private def splitLastToken(s: String): (String, String) =
+    val i = s.lastIndexOf(' ')
+    (s.take(i + 1), s.drop(i + 1))
+
+  private def commonPrefix(xs: List[String]): String =
+    xs.reduce { (a, b) =>
+      a.take(a.zip(b).takeWhile(_ == _).length)
+    }
+
+  private def completionFor(inp: String, st: ClientState): IO[List[String]] =
+    val (head, token) = splitLastToken(inp)
+    if head.isEmpty && token.startsWith("/") then
+      IO.pure(clientCommands.filter(_.startsWith(token)))
+    else if token.startsWith("@") then
+      val p = token.drop(1).toLowerCase
+      IO.pure(st.onlineUsers.filter(_.toLowerCase.startsWith(p)).sorted.map("@" + _))
+    else if token.startsWith(":") && token.length > 1 then
+      IO.pure(
+        Emoji.shortcodes.keys.toList.filter(_.startsWith(token.drop(1))).sorted.map(k => s":$k:")
+      )
+    else if inp.startsWith("/sendfile ") && head.nonEmpty then completePath(token)
+    else IO.pure(Nil)
+
+  private def completePath(token: String): IO[List[String]] =
+    IO.blocking {
+      val home = System.getProperty("user.home")
+      val expanded =
+        if token == "~" then home + "/"
+        else if token.startsWith("~/") then home + token.drop(1)
+        else token
+      val slash = expanded.lastIndexOf('/')
+      val (dir, prefix) =
+        if slash < 0 then (Paths.get("."), expanded)
+        else (Paths.get(expanded.take(slash + 1)), expanded.drop(slash + 1))
+      val keep = token.take(token.lastIndexOf('/') + 1)
+      val listing = Files.list(dir)
+      val entries =
+        try listing.iterator().asScala.toList
+        finally listing.close()
+      entries
+        .map(p => (p.getFileName.toString, Files.isDirectory(p)))
+        .filter((name, _) => name.startsWith(prefix))
+        .sortBy(_._1)
+        .map((name, isDir) => keep + name + (if isDir then "/" else ""))
+    }.handleError(_ => Nil)
+
+  private def completeInput(state: Ref[IO, ClientState], ui: Ui, ictl: InputCtl): IO[Unit] =
+    ictl.pendingPaste.get.flatMap {
+      case Some(_) => IO.unit
+      case None =>
+        (ictl.text.get, state.get).flatMapN { (inp, st) =>
+          completionFor(inp, st).flatMap {
+            case Nil => ictl.hint.set(None) *> ui.refreshInput
+            case single :: Nil =>
+              val done = if single.endsWith("/") then single else single + " "
+              ictl.text.set(splitLastToken(inp)._1 + done) *>
+                ictl.hint.set(None) *>
+                ui.refreshInput
+            case candidates =>
+              val (head, token) = splitLastToken(inp)
+              val lcp = commonPrefix(candidates)
+              val extended = if lcp.length > token.length then head + lcp else inp
+              ictl.text.set(extended) *>
+                ictl.hint.set(Some(candidates.mkString("  "))) *>
+                ui.refreshInput
+          }
+        }
+    }
 
   private def dispatchLine(
       line: String,
@@ -805,7 +1074,8 @@ object ChatClient extends IOApp:
     else if line == "/voice" then toggleVoice(state, outgoingQueue, ui, voiceRef)
     else if line == "/voicetest" then toggleVoiceTest(state, outgoingQueue, ui, voiceRef)
     else if line == "/mute" then toggleMute(state, ui, voiceRef)
-    else outgoingQueue.offer(line)
+    else if line.startsWith("/") then outgoingQueue.offer(line)
+    else outgoingQueue.offer(Emoji.expand(line))
 
   private def toggleVoice(
       state: Ref[IO, ClientState],
@@ -1095,7 +1365,7 @@ object ChatClient extends IOApp:
       outgoingQueue: Queue[IO, String],
       ui: Ui
   ): IO[Unit] =
-    IO(MessageDigest.getInstance("SHA-256")).flatMap { md =>
+    (IO(MessageDigest.getInstance("SHA-256")), Ref.of[IO, Long](0L)).flatMapN { (md, sent) =>
       Fs2Files[IO]
         .readAll(Fs2Path.fromNioPath(out.path))
         .chunkN(fileChunkSize)
@@ -1103,7 +1373,13 @@ object ChatClient extends IOApp:
         .evalMap { case (chunk, seq) =>
           val bytes = chunk.toArray
           IO(md.update(bytes)) *>
-            outgoingQueue.offer(s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(bytes)}")
+            outgoingQueue.offer(s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(bytes)}") *>
+            sent
+              .modify { prev =>
+                val now = prev + bytes.length
+                (now, progressMilestone(prev, now, out.size))
+              }
+              .flatMap(_.traverse_(pct => ui.printLine(s"Sending ${out.name}... $pct%")))
         }
         .compile
         .drain
@@ -1124,14 +1400,14 @@ object ChatClient extends IOApp:
         case None      => IO.unit
       }
 
-  private def handleFileData(msg: String, state: Ref[IO, ClientState]): IO[Unit] =
+  private def handleFileData(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
     msg.split(":", 4) match
       case Array(_, id, _, b64) =>
         state.get.map(_.incomingFiles.get(id)).flatMap {
           case None => IO.unit
           case Some(incoming) =>
             val bytes = Base64.getDecoder.decode(b64)
-            incoming.temp match
+            val write = incoming.temp match
               case Some(tmp) =>
                 IO.blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND)).void
               case None =>
@@ -1144,6 +1420,23 @@ object ChatClient extends IOApp:
                     )
                   )
                 yield ()
+            write *>
+              state
+                .modify { st =>
+                  st.incomingFiles.get(id) match
+                    case None => (st, None)
+                    case Some(inc) =>
+                      val now = inc.received + bytes.length
+                      (
+                        st.copy(incomingFiles =
+                          st.incomingFiles.updated(id, inc.copy(received = now))
+                        ),
+                        progressMilestone(inc.received, now, inc.size).map((inc, _))
+                      )
+                }
+                .flatMap(_.traverse_ { (inc, pct) =>
+                  ui.printLine(s"Receiving ${inc.name} from ${inc.from}... $pct%")
+                })
         }
       case _ => IO.unit
 
