@@ -45,7 +45,7 @@ jobs:
           echo "Files changed in the most recent commit:"
           echo "$CHANGED_FILES"
 
-          if echo "$CHANGED_FILES" | grep -q -e "\.scala$" -e "bleep\.yaml" -e "flake\.nix"; then
+          if echo "$CHANGED_FILES" | grep -q -e "\.scala$" -e "build\.sbt$" -e "^project/" -e "flake\.nix"; then
             echo "Scala or build files changed in the last commit"
             echo "scala_changed=true" >> $GITHUB_OUTPUT
           else

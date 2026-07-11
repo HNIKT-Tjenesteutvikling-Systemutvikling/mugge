@@ -2,33 +2,30 @@
   pkgs,
   src,
   customJava,
-  bleep,
+  sbt,
   ...
 }:
 rec {
-  bleepDepsCache = pkgs.stdenv.mkDerivation {
-    name = "bleep-deps-cache";
+  sbtDepsCache = pkgs.stdenv.mkDerivation {
+    name = "sbt-deps-cache";
     inherit src;
 
     nativeBuildInputs = [
-      bleep
+      sbt
       customJava
-      pkgs.coursier
-      pkgs.scala-cli
       pkgs.cacert
     ];
 
     buildPhase = ''
+      export HOME=$TMPDIR
       export JAVA_HOME=${customJava}
+      export SBT_OPTS="-Xmx4G -Xss10m"
       export COURSIER_CACHE=$out/.coursier
-      export IVY_HOME=$out/.ivy2
-      export BLEEP_HOME=$out/.bleep
-      export BLEEP_SERVER_START_TIMEOUT=300
-      export BLOOP_COMPUTATION_TIMEOUT=300
-      export JAVA_OPTS="-Xmx2G -Xms512M"
-      export COURSIER_PARALLEL_DOWNLOAD_COUNT=4
+      export SBT_GLOBAL_BASE=$out/.sbt
+      export SBT_BOOT_DIRECTORY=$out/.sbt/boot
 
-      ${bleep}/bin/bleep compile client
+      sbt -Dsbt.ci=true update
+      sbt -Dsbt.ci=true compile
     '';
 
     installPhase = ''
@@ -36,7 +33,7 @@ rec {
     '';
 
     outputHashMode = "recursive";
-    outputHash = "sha256-S1E7/3sbIwN1HNWs6H4EBNgZCZJLcOHHFoAkon6TGLo=";
+    outputHash = "sha256-B5cW4Y1vBDoO9yV2JqmMzfMm1XC4l3W+q2OXsMlDwMc=";
     outputHashAlgo = "sha256";
   };
 
@@ -45,63 +42,45 @@ rec {
     inherit src;
 
     nativeBuildInputs = [
-      bleep
+      sbt
       customJava
-      pkgs.coursier
-      pkgs.scala-cli
     ];
 
     buildPhase = ''
+      export HOME=$TMPDIR
       export JAVA_HOME=${customJava}
-
+      export SBT_OPTS="-Xmx4G -Xss10m"
       export COURSIER_CACHE=$PWD/.coursier
-      export IVY_HOME=$PWD/.ivy2
-      export BLEEP_HOME=$PWD/.bleep
+      export SBT_GLOBAL_BASE=$PWD/.sbt
+      export SBT_BOOT_DIRECTORY=$PWD/.sbt/boot
 
-      cp -r ${bleepDepsCache}/.coursier $PWD/ 2>/dev/null || true
-      cp -r ${bleepDepsCache}/.ivy2 $PWD/ 2>/dev/null || true
-      cp -r ${bleepDepsCache}/.bleep $PWD/ 2>/dev/null || true
+      cp -r ${sbtDepsCache}/.coursier $PWD/ 2>/dev/null || true
+      cp -r ${sbtDepsCache}/.sbt $PWD/ 2>/dev/null || true
+      chmod -R u+w $PWD/.coursier $PWD/.sbt 2>/dev/null || true
 
       echo "Building mugge chat client distribution..."
-      ${bleep}/bin/bleep dist client
+      sbt -Dsbt.ci=true client/stage
 
-      DIST_DIR=".bleep/builds/normal/.bloop/client/dist"
-
-      echo "Distribution contents:"
-      ls -la "$DIST_DIR"
-      ls -la "$DIST_DIR/bin" || true
-      ls -la "$DIST_DIR/lib" || true
+      STAGE_DIR="target/out/jvm/scala-3.3.1/client/universal/stage"
+      ls -la "$STAGE_DIR/bin" "$STAGE_DIR/lib"
     '';
 
     installPhase = ''
       mkdir -p $out
+      cp -r target/out/jvm/scala-3.3.1/client/universal/stage/* $out/
+      rm -f $out/bin/client.bat
 
-      DIST_DIR=".bleep/builds/normal/.bloop/client/dist"
-      cp -r "$DIST_DIR"/* $out/
-
-      if [ ! -f "$out/bin/client" ]; then
-        mkdir -p $out/bin
-        cat > $out/bin/mugge-client << 'EOF'
-      #!/usr/bin/env bash
+      # The native-packager launcher resolves java from PATH/JAVA_HOME; pin it.
+      mv $out/bin/client $out/bin/.client-unwrapped
+      cat > $out/bin/client << EOF
+      #!${pkgs.bash}/bin/bash
       export JAVA_HOME=${customJava}
-
-      CLASSPATH=""
-      for jar in $out/lib/*.jar; do
-        CLASSPATH="$CLASSPATH:$jar"
-      done
-      CLASSPATH=''${CLASSPATH#:}  
-
-      exec ${customJava}/bin/java -cp "$CLASSPATH" chat.ChatClient "$@"
+      export PATH=${customJava}/bin:\$PATH
+      exec $out/bin/.client-unwrapped "\$@"
       EOF
-        chmod +x $out/bin/mugge-client
-      else
-        substituteInPlace $out/bin/client \
-          --replace "#!/bin/sh" "#!${pkgs.bash}/bin/bash" \
-          --replace "java" "${customJava}/bin/java" || true
-        chmod +x $out/bin/client
-        
-        ln -s $out/bin/client $out/bin/mugge-client
-      fi
+      chmod +x $out/bin/client $out/bin/.client-unwrapped
+
+      ln -s $out/bin/client $out/bin/mugge-client
     '';
   };
 

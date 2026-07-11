@@ -2,26 +2,26 @@
 
 * About
 
-This project is a chat application written in Scala 3, using cats-effect for concurrency and fs2 for streaming. It's built with bleep.
+This project is a chat application written in Scala 3, using cats-effect for concurrency and fs2 for streaming. It's built with sbt.
 
 * Getting Started
 
 ** Prerequisites
 
-- [[https://bleep.build/][bleep]]
+- [[https://www.scala-sbt.org/][sbt]] (2.0)
 - A JVM
 
 ** Building the project
 
 To compile the code, run:
 #+begin_src shell
-  bleep compile
+  sbt compile
 #+end_src
 
 ** Running the client
 
 #+begin_src shell
-  bleep run client
+  sbt client/run
 #+end_src
 
 #+begin_src nix-ts

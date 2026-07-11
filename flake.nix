@@ -4,7 +4,6 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    bleepSrc.url = "github:KristianAN/bleep-flake";
     kvalreg-dev-env.url = "github:HNIKT-Tjenesteutvikling-Systemutvikling/kvalreg-dev-env";
     pre-commit-hooks-nix.url = "github:cachix/git-hooks.nix";
   };
@@ -22,9 +21,15 @@
       perSystem =
         { pkgs, system, ... }:
         let
-          bleep = inputs.bleepSrc.defaultPackage.${system};
           customJava = inputs.kvalreg-dev-env.packages.${system}.java;
           pre-commit-lib = inputs.pre-commit-hooks-nix.lib.${system};
+
+          sbt = (pkgs.sbt.override { jre = customJava; }).overrideAttrs (oldAttrs: {
+            nativeBuildInputs = oldAttrs.nativeBuildInputs or [ ] ++ [ pkgs.makeWrapper ];
+            postFixup = ''
+              wrapProgram $out/bin/sbt --prefix PATH : "${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.gnused}/bin"
+            '';
+          });
 
           commonInputs = [
             pkgs.maven
@@ -32,16 +37,17 @@
             pkgs.openssl
           ];
 
-          jvmInputs = with pkgs; [
-            jdk
-            scalafmt
-            scala-cli
-            coursier
-            bleep
+          jvmInputs = [
+            pkgs.jdk
+            pkgs.scalafmt
+            pkgs.scala-cli
+            pkgs.coursier
+            sbt
           ];
 
           jvmHook = ''
             JAVA_HOME="${customJava}"
+            export SBT_OPTS="-Xmx4G -Xss10m"
           '';
 
           publishConfig = import ./publish/default.nix {
@@ -49,7 +55,7 @@
               pkgs
               system
               customJava
-              bleep
+              sbt
               ;
             src = ./.;
           };

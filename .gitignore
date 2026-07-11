@@ -6,7 +6,12 @@ hs_err_pid*
 
 .direnv/
 result
+result-*
 
 build/
+target/
+project/target/
+project/project/
+.bsp/
 
 .scala-build/
