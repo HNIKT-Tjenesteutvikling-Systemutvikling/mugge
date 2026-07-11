@@ -749,6 +749,7 @@ object ChatClient extends IOApp:
               case Array(_, from, _, b64) =>
                 voiceRef.get.flatMap(_.traverse_(_.handle.receive(from, b64)))
               case _ => IO.unit
+          else if msg.startsWith("REMIND:") then handleReminder(msg, myUsername, ui)
           else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
           else if msg.startsWith("FILEACCEPT:") then
             handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
@@ -938,6 +939,8 @@ object ChatClient extends IOApp:
       case _ => IO.unit
 
   private val clientCommands = List(
+    "!remind",
+    "!reminders",
     "/acceptfile",
     "/auth",
     "/ban",
@@ -963,7 +966,7 @@ object ChatClient extends IOApp:
 
   private def completionFor(inp: String, st: ClientState): IO[List[String]] =
     val (head, token) = splitLastToken(inp)
-    if head.isEmpty && token.startsWith("/") then
+    if head.isEmpty && (token.startsWith("/") || token.startsWith("!")) then
       IO.pure(clientCommands.filter(_.startsWith(token)))
     else if token.startsWith("@") then
       val p = token.drop(1).toLowerCase
@@ -1237,6 +1240,19 @@ object ChatClient extends IOApp:
         logger.info(s"[Notification] $title: $body")
     }
   }
+
+  private def handleReminder(msg: String, myUsername: String, ui: Ui): IO[Unit] =
+    // REMIND:<from>:<HH:MM>:<text> — text is last and may contain ':'.
+    msg.split(":", 4) match
+      case Array(_, from, hhmm, text) =>
+        val fromSelf = from.equalsIgnoreCase(myUsername)
+        val title = if fromSelf then "⏰ Reminder" else s"⏰ Reminder from $from"
+        val line =
+          if fromSelf then s"$serverColor⏰ Reminder (set for $hhmm): $text$ansiReset"
+          else s"$serverColor⏰ Reminder from $from (set for $hhmm): $text$ansiReset"
+        ui.printLine(line) *>
+          sendNotification(title, text, urgency = "critical", timeout = 0)
+      case _ => IO.unit
 
   private def prepareSendFile(
       rest: String,

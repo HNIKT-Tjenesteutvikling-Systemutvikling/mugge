@@ -24,8 +24,9 @@ rec {
       export SBT_GLOBAL_BASE=$out/.sbt
       export SBT_BOOT_DIRECTORY=$out/.sbt/boot
 
-      sbt -Dsbt.ci=true update
-      sbt -Dsbt.ci=true compile
+      # Single invocation: a second `sbt` client racing the first one's
+      # server shutdown exits 1 without output on slower CI runners.
+      sbt -Dsbt.ci=true "update; compile"
     '';
 
     installPhase = ''
