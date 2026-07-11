@@ -1,8 +1,10 @@
 package chat
 
 import cats.effect.*
-import cats.effect.std.{Console, Mutex, Queue}
+import cats.effect.std.{Console, Mutex, Queue, UUIDGen}
 import cats.syntax.all.*
+import cats.mtl.{Raise as MtlRaise}
+import cats.mtl.Handle.allow
 import fs2.*
 import fs2.io.net.*
 import fs2.io.file.{Files as Fs2Files, Path as Fs2Path}
@@ -13,7 +15,6 @@ import scala.concurrent.duration.*
 import java.security.*
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import java.util.Base64
-import scala.jdk.CollectionConverters.*
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -29,12 +30,8 @@ object ChatClient extends IOApp:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  private val protocolVersion = 3
+  private val protocolVersion = 4
 
-  // Set by the systemd user service (task 8). In this mode the client is a
-  // shared background process, so /quit must NOT exit (that would kill the
-  // service for everyone). Leaving a terminal is a dtach action the client
-  // can't perform itself, so we point the user at it instead.
   private val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 
   private val quitHint =
@@ -42,27 +39,19 @@ object ChatClient extends IOApp:
       "(or just close the terminal) to leave without disconnecting. To stop it " +
       "entirely: systemctl --user stop mugge-chat"
 
-  private val maxFileSize = 10L * 1024 * 1024 // 10 MiB
-  private val fileChunkSize = 48 * 1024 // raw bytes per chunk before base64
+  private val maxFileSize = 10L * 1024 * 1024
+  private val fileChunkSize = 48 * 1024
 
   private val maxPasteLines = 100
   private val maxPasteChars = 8 * 1024
-  // Must stay under the server's chat bucket refill (3 lines/s after a burst
-  // of 15) or the tail of a long paste is silently rate-limit-dropped.
   private val pasteLineDelay = 400.milliseconds
 
-  // Application-level heartbeat: keeps the TCP flow non-idle so Azure's load
-  // balancer (~4 min idle drop) never silently kills a quiet connection, and
-  // doubles as a server-process liveness probe. deadAfter spans ~3 PONGs.
   private val pingInterval = 60.seconds
   private val watchdogInterval = 30.seconds
   private val deadAfter = 3.minutes
 
-  // Must stay under the server's ~5s typing lease so the indicator doesn't lapse.
   private val typingRefreshInterval = 3.seconds
 
-  // Wall-clock gap beyond the watchdog interval that we read as a resume from
-  // suspend (the scheduler's monotonic clock freezes across a suspend).
   private val suspendGraceThreshold = 30.seconds
 
   private val reconnectInitialBackoff = 2.seconds
@@ -78,8 +67,25 @@ object ChatClient extends IOApp:
       received: Long = 0
   )
 
-  // Quartile just crossed by going from prev to now bytes (25/50/75), if any;
-  // 100% is covered by the existing completion message.
+  private enum FileError:
+    case NotFound(path: String)
+    case NotRegular(path: String)
+    case NotReadable(path: String)
+    case TooLarge(size: Long)
+    case Unreadable(detail: String)
+    case ChecksumMismatch(name: String)
+
+  private def fileErrorMessage(e: FileError): String = e match
+    case FileError.NotFound(p)         => s"File not found: $p"
+    case FileError.NotRegular(p)       => s"Not a regular file: $p"
+    case FileError.NotReadable(p)      => s"File is not readable: $p"
+    case FileError.TooLarge(s)         => s"File too large ($s bytes). Max is $maxFileSize bytes."
+    case FileError.Unreadable(d)       => s"Could not read file: $d"
+    case FileError.ChecksumMismatch(n) => s"Checksum mismatch for $n; download discarded."
+
+  private def raiseFile[A](e: FileError)(using r: MtlRaise[IO, FileError]): IO[A] =
+    r.raise(e)
+
   private def progressMilestone(prev: Long, now: Long, total: Long): Option[Int] =
     if total <= 0 then None
     else
@@ -102,8 +108,6 @@ object ChatClient extends IOApp:
       voiceUsers: List[String] = Nil
   )
 
-  // Live voice session: the Audio handle plus a fully-releasing teardown
-  // (cancel capture/playback fibers, close the mic and speaker lines).
   private case class Voice(handle: Audio.Handle, teardown: IO[Unit])
 
   private enum SessionOutcome:
@@ -143,8 +147,6 @@ object ChatClient extends IOApp:
 
   private val serverColor = "\u001b[38;5;245m"
 
-  // Wraps on display cells: ANSI escape sequences are zero-width and never
-  // split; SGR state carries across physical rows on its own.
   private def wrapAnsi(s: String, width: Int): List[String] =
     val rows = List.newBuilder[String]
     val row = new StringBuilder
@@ -175,8 +177,6 @@ object ChatClient extends IOApp:
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
 
-  // True only for a genuine server-authored line (clientId == SERVER); guards
-  // the auth-success interception so a user can't spoof it by typing the phrase.
   private def isFromServer(msg: String): Boolean =
     msg match
       case displayPattern(_, _, sender, _) => sender.trim == "SERVER"
@@ -208,22 +208,19 @@ object ChatClient extends IOApp:
 
   private val panelWidth = 24
 
-  // (cols, rows) when stdout is an interactive TTY, else None (piped/redirected).
-  // Reads the size from the controlling terminal (/dev/tty) rather than `tput`,
-  // whose result would be the 80-col default when our stdout is captured.
   private def detectTerminal: IO[Option[(Int, Int)]] =
-    if System.console() == null then IO.pure(None)
-    else
-      IO.blocking(Seq("sh", "-c", "stty size < /dev/tty").!!.trim)
-        .map { out =>
-          out.split("\\s+").toList match
-            case rows :: cols :: Nil =>
-              // 0x0 => a headless pty (e.g. dtach -N with no client attached);
-              // treat as no-TTY so we fall back to plain-line mode.
-              (cols.toIntOption, rows.toIntOption).tupled.filter((c, r) => c > 0 && r > 0)
-            case _ => None
-        }
-        .handleError(_ => None)
+    IO(Option(System.console())).flatMap {
+      case None => IO.pure(None)
+      case Some(_) =>
+        IO.blocking(Seq("sh", "-c", "stty size < /dev/tty").!!.trim)
+          .map { out =>
+            out.split("\\s+").toList match
+              case rows :: cols :: Nil =>
+                (cols.toIntOption, rows.toIntOption).tupled.filter((c, r) => c > 0 && r > 0)
+              case _ => None
+          }
+          .handleError(_ => None)
+    }
 
   private val inputPrompt = "> "
 
@@ -243,8 +240,6 @@ object ChatClient extends IOApp:
     case Ground, Esc
     case Csi(params: String)
 
-  // Folds the raw char stream into tokens: bracketed-paste markers surface as
-  // tokens, all other escape sequences (arrow keys etc.) are swallowed.
   private def tokenize(chars: Stream[IO, Char]): Stream[IO, InputToken] =
     chars
       .mapAccumulate(EscState.Ground: EscState) { (st, c) =>
@@ -413,7 +408,6 @@ object ChatClient extends IOApp:
         val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
         s"\u001b[${2 + i};${startCol}H$color$bullet $name$ansiReset"
       }.mkString
-      // \u001b7 save cursor+attrs, \u001b8 restore.
       s"\u001b7$clears$header$entries\u001b8"
 
   def run(args: List[String]): IO[ExitCode] =
@@ -432,14 +426,16 @@ object ChatClient extends IOApp:
       _ <- logger.info(s"Mugge Chat Client starting...")
       _ <- logger.info(s"Server: $host:$port")
       myUsername <- getUsername
-      githubUsername <- Authentication.detectGithubUsername().flatMap(IO.fromEither)
+      githubUsername <- allow[Authentication.AuthError] {
+        Authentication.detectGithubUsername()
+      }.rescue { err =>
+        logger.warn(s"Could not detect GitHub username: ${err.message}").as(None)
+      }
       _ <- logger.info(s"The github username is: ${githubUsername}")
       _ <- githubUsername match
         case Some(ghu) => logger.debug(s"Detected GitHub username: $ghu")
         case None      => logger.error("Could not detect GitHub username from git config")
 
-      // Trust-all: the server presents an ephemeral self-signed cert, so there
-      // is nothing to validate — this only encrypts the transport.
       tlsContext <- Network[IO].tlsContext.insecure
       connectOnce = Network[IO]
         .client(SocketAddress(host, port))
@@ -467,7 +463,6 @@ object ChatClient extends IOApp:
       exitCode <- reconnectLoop(connectOnce, reconnectInitialBackoff)
     yield exitCode
 
-  // Only the background service reconnects; a foreground client exits on a drop.
   private def reconnectLoop(
       connectOnce: IO[SessionOutcome],
       backoff: FiniteDuration
@@ -509,16 +504,13 @@ object ChatClient extends IOApp:
       hostname <- getHostname
       currentState <- state.get
       privateKey <- currentState.githubUsername.flatTraverse { _ =>
-        Authentication
-          .loadPrivateKey()
-          .flatMap {
-            case Right(key) => IO.pure(Some(key))
-            case Left(err) =>
-              logger.warn(s"Could not load SSH private key: ${err.message}").as(None)
-          }
-          .handleErrorWith { err =>
-            logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
-          }
+        allow[Authentication.AuthError] {
+          Authentication.loadPrivateKey().map(_.some)
+        }.rescue { err =>
+          logger.warn(s"Could not load SSH private key: ${err.message}").as(None)
+        }.handleErrorWith { err =>
+          logger.error(s"Could not load SSH private key: ${err.getMessage}").as(None)
+        }
       }
       _ <- privateKey.traverse_(key => state.update(_.copy(privateKey = Some(key))))
       authData = currentState.githubUsername
@@ -533,12 +525,8 @@ object ChatClient extends IOApp:
 
     (
       detectTerminal,
-      // Fixed for the process: is our stdout backed by a terminal device at
-      // all? (Under the dtach service this stays true even while headless.)
-      IO(System.console() != null),
+      IO(Option(System.console()).isDefined),
       Mutex[IO],
-      // Bounded to keep a stuck socket from ballooning memory; offers apply
-      // backpressure (the file-send loop naturally throttles to the socket).
       Queue.bounded[IO, String](1024),
       Deferred[IO, Either[Throwable, Unit]],
       IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
@@ -581,7 +569,6 @@ object ChatClient extends IOApp:
           .map(_ + "\n")
           .evalTap {
             case data if controlNoise(data.trim) => IO.unit
-            // Never write secrets or file bytes to the log verbatim.
             case data if sensitiveOutbound(data.trim) =>
               logger.debug("Writing to server: <redacted sensitive line>")
             case data => logger.debug(s"Writing to server: $data")
@@ -613,9 +600,6 @@ object ChatClient extends IOApp:
           .awakeEvery[IO](pingInterval)
           .evalMap(_ => outgoingQueue.offer("PING"))
 
-      // Re-assert TYPING while the user is still composing so the server's
-      // typing lease never lapses mid-word; membership-stable so it triggers
-      // no rebroadcast storm on the server side.
       val typingRefresher: Stream[IO, Unit] =
         Stream.awakeEvery[IO](typingRefreshInterval).evalMap { _ =>
           (composing.get, input.get).flatMapN { (c, inp) =>
@@ -623,9 +607,6 @@ object ChatClient extends IOApp:
           }
         }
 
-      // Trips when no line (chat, PONG, anything) has arrived for deadAfter,
-      // turning a silent Azure drop into a clean teardown + nonzero exit so a
-      // supervisor (task 8) restarts us instead of us looking alive but deaf.
       val watchdog: Stream[IO, Unit] =
         Stream.awakeEvery[IO](watchdogInterval).evalMap { _ =>
           for
@@ -647,11 +628,6 @@ object ChatClient extends IOApp:
           yield ()
         }
 
-      // Window size isn't fixed: under the dtach-based service the pty starts
-      // headless (0x0) and only gains real dimensions when someone runs `mugge`
-      // to attach. Poll for that transition so the online-users panel and inline
-      // input rendering come to life on attach (and fold back to plain output on
-      // detach). Pointless without a pty in the first place.
       val terminalWatcher: Stream[IO, Unit] =
         if !pty then Stream.empty.covary[IO]
         else
@@ -660,8 +636,6 @@ object ChatClient extends IOApp:
               termSize.getAndSet(latest).flatMap { previous =>
                 if previous == latest then IO.unit
                 else
-                  // A newly-attached terminal (dtach) never saw the startup
-                  // enable, so re-assert bracketed paste on attach.
                   (if previous.isEmpty && latest.isDefined then Console[IO].print("\u001b[?2004h")
                    else IO.unit) *> ui.onResize
               }
@@ -702,21 +676,14 @@ object ChatClient extends IOApp:
     }
   }
 
-  // Names of control lines that must never reach the client log.
   private def controlNoise(line: String): Boolean =
     line == "PING" || line == "TYPING" || line == "TYPINGSTOP" ||
       line == "VOICEJOIN" || line == "VOICELEAVE" || line.startsWith("VOICE:")
 
-  // Outbound lines whose contents must never be logged verbatim: auth
-  // signatures (challenge-response secret material) and file payloads.
   private def sensitiveOutbound(line: String): Boolean =
     line.startsWith("SIGNATURE:") || line.startsWith("/verify ") ||
       line.startsWith("FILEDATA:") || line.startsWith("FILEEND:")
 
-  // Puts the controlling terminal into non-canonical, no-echo mode so we can
-  // observe keystrokes as they happen (for typing indicators) and render the
-  // input line ourselves. Original settings are captured up front and restored
-  // on release, even on crash/cancel. A no-op when we have no TTY.
   private def rawMode(pty: Boolean): Resource[IO, Unit] =
     if !pty then Resource.unit[IO]
     else
@@ -754,8 +721,6 @@ object ChatClient extends IOApp:
         IO.monotonic.flatMap(lastReceived.set) *> {
           if msg == "PONG" then IO.unit
           else if msg.startsWith("INCOMPATIBLE:") then
-            // Server refused us on version grounds; it already includes the
-            // update-and-rebuild guidance. Show it and tear down cleanly.
             incompatible.set(true) *>
               ui.printLine(msg.drop("INCOMPATIBLE:".length)) *>
               halt.complete(Right(())).void
@@ -767,8 +732,6 @@ object ChatClient extends IOApp:
             val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setUsers(users)
           else if msg.startsWith("TYPING:") then
-            // Belt-and-braces: the server already excludes us, but drop our own
-            // name too so we never see ourselves listed as typing.
             val users = msg
               .drop(7)
               .split(",")
@@ -782,8 +745,6 @@ object ChatClient extends IOApp:
               msg.drop("VOICEUSERS:".length).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setVoiceUsers(users)
           else if msg.startsWith("VOICE:") then
-            // VOICE:<from>:<seq>:<base64-pcm> — decode into the sender's jitter
-            // buffer; dropped silently if we've since left voice.
             msg.split(":", 4) match
               case Array(_, from, _, b64) =>
                 voiceRef.get.flatMap(_.traverse_(_.handle.receive(from, b64)))
@@ -815,12 +776,16 @@ object ChatClient extends IOApp:
       currentState <- state.get
       _ <- (currentState.privateKey, currentState.githubUsername) match {
         case (Some(privateKey), Some(githubUsername)) =>
-          for {
-            _ <- logger.debug(s"Received auto-auth challenge, signing for '$githubUsername'...")
-            signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
-            _ <- outgoingQueue.offer(s"SIGNATURE:$signature")
-            _ <- logger.debug("Auto-authentication response sent to queue.")
-          } yield ()
+          allow[Authentication.AuthError] {
+            for {
+              _ <- logger.debug(s"Received auto-auth challenge, signing for '$githubUsername'...")
+              signature <- Authentication.signChallenge(challenge, privateKey)
+              _ <- outgoingQueue.offer(s"SIGNATURE:$signature")
+              _ <- logger.debug("Auto-authentication response sent to queue.")
+            } yield ()
+          }.rescue { err =>
+            logger.warn(s"Could not sign auto-auth challenge: ${err.message}")
+          }
 
         case _ =>
           logger.debug("Cannot auto-authenticate: missing private key or GitHub username.")
@@ -836,11 +801,15 @@ object ChatClient extends IOApp:
       currentState <- state.get
       _ <- currentState.privateKey match
         case Some(privateKey) =>
-          for
-            _ <- logger.debug(s"Received authentication challenge, auto-signing...")
-            signature <- Authentication.signChallenge(challenge, privateKey).flatMap(IO.fromEither)
-            _ <- outgoingQueue.offer(s"/verify $signature")
-          yield ()
+          allow[Authentication.AuthError] {
+            for
+              _ <- logger.debug(s"Received authentication challenge, auto-signing...")
+              signature <- Authentication.signChallenge(challenge, privateKey)
+              _ <- outgoingQueue.offer(s"/verify $signature")
+            yield ()
+          }.rescue { err =>
+            logger.warn(s"Could not sign challenge: ${err.message}")
+          }
         case None =>
           logger.error("Cannot sign challenge: SSH private key not loaded")
     yield ()
@@ -854,19 +823,14 @@ object ChatClient extends IOApp:
       voiceRef: Ref[IO, Option[Voice]]
   ): Stream[IO, Nothing] =
     if !ui.isTty then
-      // No TTY (piped/redirected): stay line-based, no typing signals, no
-      // escapes — the terminal still echoes and there is nothing to erase.
       Stream
-        .repeatEval(Console[IO].readLine)
+        .repeatEval(Console[IO].readLine.map(Option(_)))
         .evalMap {
-          case s if s == null => halt.complete(Right(())).void
-          case s              => dispatchLine(s.trim, outgoingQueue, halt, state, ui, voiceRef)
+          case None    => halt.complete(Right(())).void
+          case Some(s) => dispatchLine(s.trim, outgoingQueue, halt, state, ui, voiceRef)
         }
         .drain
     else
-      // Raw mode: assemble lines from single characters ourselves so we can
-      // observe typing as it happens and render the input line under our
-      // control (echo is off).
       tokenize(
         fs2.io
           .stdin[IO](64)
@@ -973,7 +937,6 @@ object ChatClient extends IOApp:
           startTyping(outgoingQueue, ictl.composing)
       case _ => IO.unit
 
-  // Hand-mirrors the server's commandHelp; keep in sync when commands change.
   private val clientCommands = List(
     "/acceptfile",
     "/auth",
@@ -1013,7 +976,7 @@ object ChatClient extends IOApp:
     else IO.pure(Nil)
 
   private def completePath(token: String): IO[List[String]] =
-    IO.blocking {
+    IO {
       val home = System.getProperty("user.home")
       val expanded =
         if token == "~" then home + "/"
@@ -1024,15 +987,18 @@ object ChatClient extends IOApp:
         if slash < 0 then (Paths.get("."), expanded)
         else (Paths.get(expanded.take(slash + 1)), expanded.drop(slash + 1))
       val keep = token.take(token.lastIndexOf('/') + 1)
-      val listing = Files.list(dir)
-      val entries =
-        try listing.iterator().asScala.toList
-        finally listing.close()
-      entries
-        .map(p => (p.getFileName.toString, Files.isDirectory(p)))
-        .filter((name, _) => name.startsWith(prefix))
-        .sortBy(_._1)
-        .map((name, isDir) => keep + name + (if isDir then "/" else ""))
+      (dir, prefix, keep)
+    }.flatMap { (dir, prefix, keep) =>
+      Fs2Files[IO]
+        .list(Fs2Path.fromNioPath(dir))
+        .evalMap(p => Fs2Files[IO].isDirectory(p).map(d => (p.fileName.toString, d)))
+        .compile
+        .toList
+        .map(
+          _.filter((name, _) => name.startsWith(prefix))
+            .sortBy(_._1)
+            .map((name, isDir) => keep + name + (if isDir then "/" else ""))
+        )
     }.handleError(_ => Nil)
 
   private def completeInput(state: Ref[IO, ClientState], ui: Ui, ictl: InputCtl): IO[Unit] =
@@ -1088,9 +1054,6 @@ object ChatClient extends IOApp:
       case None    => startVoice(state, outgoingQueue, ui, voiceRef, loopback = false)
     }
 
-  // Local self-test: no server involved. Captured frames are fed straight back
-  // into our own playback path, so a single user can confirm the mic, speaker,
-  // VOX, encode/decode and mixing all work by hearing themselves.
   private def toggleVoiceTest(
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String],
@@ -1109,12 +1072,8 @@ object ChatClient extends IOApp:
       voiceRef: Ref[IO, Option[Voice]],
       loopback: Boolean
   ): IO[Unit] =
-    Audio.open(state.get.map(_.muted)).allocated.attempt.flatMap {
-      case Left(err) =>
-        ui.printLine(
-          s"Voice unavailable: ${Option(err.getMessage).getOrElse(err.toString)}. Staying in text mode."
-        )
-      case Right((handle, release)) =>
+    allow[Audio.AudioError] {
+      Audio.open(state.get.map(_.muted)).allocated.flatMap { case (handle, release) =>
         for
           seq <- Ref.of[IO, Int](0)
           captureFib <- handle.frames
@@ -1138,6 +1097,9 @@ object ChatClient extends IOApp:
               "Joined voice. Use headphones to avoid echo. /mute toggles your mic, /voice leaves."
           )
         yield ()
+      }
+    }.rescue { err =>
+      ui.printLine(s"Voice unavailable: ${err.message}. Staying in text mode.")
     }
 
   private def stopVoice(
@@ -1203,9 +1165,6 @@ object ChatClient extends IOApp:
       case _ =>
         IO.unit
 
-  // Per-sender ping allowance: at most maxPingsPerWindow notifications from a
-  // given sender within pingWindow, after which that sender is muted until the
-  // window rolls off. Stops a `!ping @me 1000` from flooding the tray.
   private val maxPingsPerWindow = 3
   private val pingWindow = 5.minutes
 
@@ -1279,9 +1238,6 @@ object ChatClient extends IOApp:
     }
   }
 
-  // Sender: user typed `/sendfile @user <path>`. Validate locally, then send
-  // the wire form `/sendfile @user <id> <size> <name>` (server can't stat the
-  // file), remembering id -> path until the receiver accepts.
   private def prepareSendFile(
       rest: String,
       state: Ref[IO, ClientState],
@@ -1291,27 +1247,29 @@ object ChatClient extends IOApp:
     rest.trim.split(" ", 2) match
       case Array(targetToken, rawPath) if targetToken.startsWith("@") =>
         val path = Paths.get(rawPath.trim)
-        IO.blocking {
-          val regular = Files.isRegularFile(path)
-          val readable = regular && Files.isReadable(path)
-          val size = if regular then Files.size(path) else -1L
-          (Files.exists(path), regular, readable, size)
-        }.attempt
-          .flatMap {
-            case Right((false, _, _, _)) => ui.printLine(s"File not found: $rawPath")
-            case Right((_, false, _, _)) => ui.printLine(s"Not a regular file: $rawPath")
-            case Right((_, _, false, _)) => ui.printLine(s"File is not readable: $rawPath")
-            case Right((_, _, _, s)) if s > maxFileSize =>
-              ui.printLine(s"File too large ($s bytes). Max is $maxFileSize bytes.")
-            case Right((_, _, _, size)) =>
-              val id = java.util.UUID.randomUUID().toString.take(8)
-              val name = path.getFileName.toString
-              state.update(st =>
-                st.copy(outgoingFiles = st.outgoingFiles + (id -> OutgoingFile(path, name, size)))
-              ) *>
-                outgoingQueue.offer(s"/sendfile $targetToken $id $size $name")
-            case Left(err) => ui.printLine(s"Could not read file: ${err.getMessage}")
-          }
+        allow[FileError] {
+          for
+            checked <- IO.blocking {
+              val regular = Files.isRegularFile(path)
+              val readable = regular && Files.isReadable(path)
+              val size = if regular then Files.size(path) else -1L
+              (Files.exists(path), regular, readable, size)
+            }.attempt
+            size <- checked match
+              case Left(err)               => raiseFile(FileError.Unreadable(err.getMessage))
+              case Right((false, _, _, _)) => raiseFile(FileError.NotFound(rawPath))
+              case Right((_, false, _, _)) => raiseFile(FileError.NotRegular(rawPath))
+              case Right((_, _, false, _)) => raiseFile(FileError.NotReadable(rawPath))
+              case Right((_, _, _, s)) if s > maxFileSize => raiseFile(FileError.TooLarge(s))
+              case Right((_, _, _, s))                    => IO.pure(s)
+            id <- UUIDGen[IO].randomUUID.map(_.toString.take(8))
+            name = path.getFileName.toString
+            _ <- state.update(st =>
+              st.copy(outgoingFiles = st.outgoingFiles + (id -> OutgoingFile(path, name, size)))
+            )
+            _ <- outgoingQueue.offer(s"/sendfile $targetToken $id $size $name")
+          yield ()
+        }.rescue(e => ui.printLine(fileErrorMessage(e)))
       case _ =>
         ui.printLine("Usage: /sendfile @user <path>")
 
@@ -1339,7 +1297,6 @@ object ChatClient extends IOApp:
           )
       case _ => IO.unit
 
-  // Run detached (via `.start`) so the server read loop keeps flowing while sending.
   private def handleFileAccept(
       id: String,
       state: Ref[IO, ClientState],
@@ -1355,10 +1312,6 @@ object ChatClient extends IOApp:
         case None => IO.unit
       }
 
-  // Stream the file from disk in fixed-size chunks (bounded memory even for a
-  // 10 MiB file), base64-ing each and folding a running SHA-256, rather than
-  // reading the whole file into memory. Backpressure comes from the bounded
-  // outgoing queue.
   private def sendFileData(
       id: String,
       out: OutgoingFile,
@@ -1463,29 +1416,30 @@ object ChatClient extends IOApp:
       incoming: IncomingFile,
       ui: Ui
   ): IO[Unit] =
-    streamSha256(tmp).flatMap { actualSha =>
-      if !actualSha.equalsIgnoreCase(expectedSha) then
-        IO.blocking(Files.deleteIfExists(tmp)).attempt.void *>
-          ui.printLine(s"Checksum mismatch for ${incoming.name}; download discarded.")
-      else
-        for
-          dir <- downloadDir
-          _ <- IO.blocking(Files.createDirectories(dir))
-          target <- IO.blocking(uniqueTarget(dir, incoming.name))
-          _ <- IO.blocking(Files.move(tmp, target))
-          _ <- ui.printLine(s"Saved ${incoming.name} from ${incoming.from} to $target")
-          _ <- sendNotification(
-            title = s"📎 File received from ${incoming.from}",
-            body = s"Saved to $target",
-            urgency = "normal"
-          )
-        yield ()
-    }
+    allow[FileError] {
+      streamSha256(tmp).flatMap { actualSha =>
+        if !actualSha.equalsIgnoreCase(expectedSha) then
+          IO.blocking(Files.deleteIfExists(tmp)).attempt.void *>
+            raiseFile(FileError.ChecksumMismatch(incoming.name))
+        else
+          for
+            dir <- downloadDir
+            _ <- IO.blocking(Files.createDirectories(dir))
+            target <- IO.blocking(uniqueTarget(dir, incoming.name))
+            _ <- IO.blocking(Files.move(tmp, target))
+            _ <- ui.printLine(s"Saved ${incoming.name} from ${incoming.from} to $target")
+            _ <- sendNotification(
+              title = s"📎 File received from ${incoming.from}",
+              body = s"Saved to $target",
+              urgency = "normal"
+            )
+          yield ()
+      }
+    }.rescue(e => ui.printLine(fileErrorMessage(e)))
 
   private def toHex(bytes: Array[Byte]): String =
     bytes.map(b => f"${b & 0xff}%02x").mkString
 
-  // Fold a SHA-256 over the file on disk in chunks, without loading it wholesale.
   private def streamSha256(path: Path): IO[String] =
     IO(MessageDigest.getInstance("SHA-256")).flatMap { md =>
       Fs2Files[IO]
@@ -1518,8 +1472,8 @@ object ChatClient extends IOApp:
       val dot = name.lastIndexOf('.')
       val (base, ext) =
         if dot > 0 then (name.substring(0, dot), name.substring(dot)) else (name, "")
-      Iterator
+      LazyList
         .from(1)
         .map(i => dir.resolve(s"$base ($i)$ext"))
         .find(p => !Files.exists(p))
-        .get
+        .getOrElse(initial)

@@ -3,24 +3,25 @@ package chat
 import cats.effect.*
 import cats.effect.std.Queue
 import cats.syntax.all.*
+import cats.mtl.Raise
 import fs2.Stream
 import scala.concurrent.duration.*
 import java.util.Base64
 import javax.sound.sampled.{AudioFormat, AudioSystem, SourceDataLine, TargetDataLine}
 
-// Raw PCM voice over the existing TLS line protocol: 16 kHz, 16-bit signed LE,
-// mono, 40 ms frames. All JDK-only (javax.sound.sampled); no new dependencies.
 object Audio:
+  final case class AudioError(message: String)
+
+  private def orRaise[A](io: IO[A])(using r: Raise[IO, AudioError]): IO[A] =
+    io.handleErrorWith(e => r.raise(AudioError(Option(e.getMessage).getOrElse(e.toString))))
+
   private val sampleRate = 16000f
   private val frameSamples = 640 // 40 ms at 16 kHz
   private val frameBytes = frameSamples * 2
 
-  // VOX: only send frames whose RMS clears the threshold, plus a short hangover
-  // after speech so word tails aren't clipped. Tuned constants, no config knob.
   private val voxRmsThreshold = 450.0
   private val hangoverFrames = 6 // ~240 ms
 
-  // Per-sender jitter buffer; drop-oldest on overflow (circularBuffer).
   private val jitterCapacity = 5
   private val lineBufferBytes = frameBytes * 4
 
@@ -37,8 +38,7 @@ object Audio:
     val frames: Stream[IO, String] =
       Stream
         .repeatEval(IO.blocking(readFrame(capture)))
-        .takeWhile(_.isDefined)
-        .map(_.get)
+        .unNoneTerminate
         .evalMap { buf =>
           checkMuted.flatMap { muted =>
             if muted then hangover.set(0).as(None)
@@ -67,8 +67,6 @@ object Audio:
         }
       }
 
-    // Every 40 ms take at most one frame per active sender and write their sum
-    // (clamped to Short range). One speaker passes through; several mix.
     val playback: Stream[IO, Unit] =
       Stream.awakeEvery[IO](40.millis).evalMap { _ =>
         senders.get
@@ -82,20 +80,20 @@ object Audio:
           }
       }
 
-  def open(checkMuted: IO[Boolean]): Resource[IO, Handle] =
+  def open(checkMuted: IO[Boolean])(using Raise[IO, AudioError]): Resource[IO, Handle] =
     for
-      capture <- Resource.make(IO.blocking {
+      capture <- Resource.make(orRaise(IO.blocking {
         val line = AudioSystem.getTargetDataLine(format)
         line.open(format, lineBufferBytes)
         line.start()
         line
-      })(l => IO.blocking { l.stop(); l.close() })
-      playback <- Resource.make(IO.blocking {
+      }))(l => IO.blocking { l.stop(); l.close() })
+      playback <- Resource.make(orRaise(IO.blocking {
         val line = AudioSystem.getSourceDataLine(format)
         line.open(format, lineBufferBytes)
         line.start()
         line
-      })(l => IO.blocking { l.flush(); l.stop(); l.close() })
+      }))(l => IO.blocking { l.flush(); l.stop(); l.close() })
       senders <- Resource.eval(Ref.of[IO, Map[String, Queue[IO, Array[Short]]]](Map.empty))
       hangover <- Resource.eval(Ref.of[IO, Int](0))
     yield new Handle(senders, hangover, capture, playback, checkMuted)
