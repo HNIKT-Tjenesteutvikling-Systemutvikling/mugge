@@ -1,24 +1,32 @@
 package chat
 
 import cats.effect.*
-import cats.effect.std.{Console, Mutex, Queue, UUIDGen}
-import cats.syntax.all.*
-import cats.mtl.{Raise as MtlRaise}
+import cats.effect.std.Console
+import cats.effect.std.Mutex
+import cats.effect.std.Queue
+import cats.effect.std.UUIDGen
 import cats.mtl.Handle.allow
-import fs2.*
-import fs2.io.net.*
-import fs2.io.file.{Files as Fs2Files, Path as Fs2Path}
+import cats.mtl.Raise as MtlRaise
+import cats.syntax.all.*
 import com.comcast.ip4s.*
-import java.io.IOException
-import scala.sys.process.*
-import scala.concurrent.duration.*
-import java.security.*
-import java.nio.file.{Files, Path, Paths, StandardOpenOption}
-import java.util.Base64
+import fs2.*
+import fs2.io.file.Files as Fs2Files
+import fs2.io.file.Path as Fs2Path
+import fs2.io.net.*
+import org.typelevel.log4cats.Logger as TLogger
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import org.typelevel.log4cats.slf4j.Slf4jLogger
-import org.typelevel.log4cats.{Logger => TLogger}
+
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardOpenOption
+import java.security.*
+import java.util.Base64
+import scala.concurrent.duration.*
+import scala.sys.process.*
 
 object ChatClient extends IOApp:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]
@@ -147,32 +155,25 @@ object ChatClient extends IOApp:
 
   private val serverColor = "\u001b[38;5;245m"
 
+  private def ansiSeqLength(s: String, start: Int): Int =
+    if start + 1 >= s.length then 1
+    else if s.charAt(start + 1) == '[' then
+      val finalByte = s.indexWhere(c => c >= '@' && c <= '~', start + 2)
+      if finalByte < 0 then s.length - start else finalByte - start + 1
+    else 2
+
   private def wrapAnsi(s: String, width: Int): List[String] =
-    val rows = List.newBuilder[String]
-    val row = new StringBuilder
-    var cells = 0
-    var i = 0
-    while i < s.length do
-      if s.charAt(i) == '\u001b' then
-        val start = i
-        i += 1
-        if i < s.length && s.charAt(i) == '[' then
-          i += 1
-          while i < s.length && (s.charAt(i) < '@' || s.charAt(i) > '~') do i += 1
-          if i < s.length then i += 1
-        else if i < s.length then i += 1
-        row.append(s.substring(start, i))
+    @annotation.tailrec
+    def loop(i: Int, cells: Int, row: String, acc: List[String]): List[String] =
+      if i >= s.length then acc :+ row
+      else if s.charAt(i) == '\u001b' then
+        val len = ansiSeqLength(s, i)
+        loop(i + len, cells, row + s.substring(i, i + len), acc)
+      else if cells == width then loop(i, 0, "", acc :+ row)
       else
-        if cells == width then
-          rows += row.result()
-          row.setLength(0)
-          cells = 0
         val n = Character.charCount(s.codePointAt(i))
-        row.append(s.substring(i, i + n))
-        cells += 1
-        i += n
-    rows += row.result()
-    rows.result()
+        loop(i + n, cells + 1, row + s.substring(i, i + n), acc)
+    loop(0, 0, "", Nil)
 
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
@@ -1218,7 +1219,7 @@ object ChatClient extends IOApp:
   private def sendNotification(
       title: String,
       body: String,
-      urgency: String = "normal",
+      urgency: String,
       timeout: Int = 5000
   ): IO[Unit] = {
     val command = Seq(
@@ -1238,8 +1239,13 @@ object ChatClient extends IOApp:
     IO.blocking(command.!).void.handleErrorWith { e =>
       logger.error(s"[Notification Error] ${e.getMessage}") *>
         logger.info(s"[Notification] $title: $body")
-    }
+    } <* playNotificationSound(urgency == "critical").start.void
   }
+
+  private def playNotificationSound(critical: Boolean): IO[Unit] =
+    allow[Audio.AudioError] {
+      Audio.playTone(critical)
+    }.rescue(err => logger.debug(s"[Notification Sound] ${err.message}"))
 
   private def handleReminder(msg: String, myUsername: String, ui: Ui): IO[Unit] =
     // REMIND:<from>:<HH:MM>:<text> — text is last and may contain ':'.

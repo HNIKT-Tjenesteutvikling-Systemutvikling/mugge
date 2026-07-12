@@ -1,18 +1,20 @@
 package chat
 
 import cats.effect.*
-import cats.syntax.all.*
 import cats.mtl.Raise
-import java.security.*
-import java.security.spec.*
-import java.util.Base64
-import java.nio.ByteBuffer
-import java.nio.file.{Files, Paths}
-import scala.sys.process.*
+import cats.syntax.all.*
+import org.typelevel.log4cats.Logger as TLogger
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import org.typelevel.log4cats.slf4j.Slf4jLogger
-import org.typelevel.log4cats.{Logger => TLogger}
+
+import java.nio.ByteBuffer
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.security.*
+import java.security.spec.*
+import java.util.Base64
+import scala.sys.process.*
 
 object Authentication:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]

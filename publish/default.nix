@@ -34,7 +34,7 @@ rec {
     '';
 
     outputHashMode = "recursive";
-    outputHash = "sha256-B5cW4Y1vBDoO9yV2JqmMzfMm1XC4l3W+q2OXsMlDwMc=";
+    outputHash = "sha256-6hHouTLWe8RJSqqrjfABbijOFaS7ScvYxTrjITim8Q4=";
     outputHashAlgo = "sha256";
   };
 
@@ -62,13 +62,13 @@ rec {
       echo "Building mugge chat client distribution..."
       sbt -Dsbt.ci=true client/stage
 
-      STAGE_DIR="target/out/jvm/scala-3.3.1/client/universal/stage"
+      STAGE_DIR="target/out/jvm/scala-3.3.8/client/universal/stage"
       ls -la "$STAGE_DIR/bin" "$STAGE_DIR/lib"
     '';
 
     installPhase = ''
       mkdir -p $out
-      cp -r target/out/jvm/scala-3.3.1/client/universal/stage/* $out/
+      cp -r target/out/jvm/scala-3.3.8/client/universal/stage/* $out/
       rm -f $out/bin/client.bat
 
       # The native-packager launcher resolves java from PATH/JAVA_HOME; pin it.

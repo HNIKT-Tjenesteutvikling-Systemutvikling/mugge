@@ -2,12 +2,16 @@ package chat
 
 import cats.effect.*
 import cats.effect.std.Queue
-import cats.syntax.all.*
 import cats.mtl.Raise
+import cats.syntax.all.*
 import fs2.Stream
-import scala.concurrent.duration.*
+
 import java.util.Base64
-import javax.sound.sampled.{AudioFormat, AudioSystem, SourceDataLine, TargetDataLine}
+import javax.sound.sampled.AudioFormat
+import javax.sound.sampled.AudioSystem
+import javax.sound.sampled.SourceDataLine
+import javax.sound.sampled.TargetDataLine
+import scala.concurrent.duration.*
 
 object Audio:
   final case class AudioError(message: String)
@@ -80,6 +84,34 @@ object Audio:
           }
       }
 
+  private val toneFreq = 880.0
+  private val toneMillis = 120
+  private val gapMillis = 60
+
+  def playTone(critical: Boolean)(using Raise[IO, AudioError]): IO[Unit] =
+    val beep = toneBytes(toneMillis)
+    val gap = Array.fill[Byte]((sampleRate * gapMillis / 1000).toInt * 2)(0)
+    val buffers = if critical then List(beep, gap, beep) else List(beep)
+    orRaise(IO.blocking {
+      val line = AudioSystem.getSourceDataLine(format)
+      line.open(format, lineBufferBytes)
+      line.start()
+      buffers.foreach(b => line.write(b, 0, b.length))
+      line.drain()
+      line.stop()
+      line.close()
+    })
+
+  private def toneBytes(millis: Int): Array[Byte] =
+    val n = (sampleRate * millis / 1000).toInt
+    val fade = (sampleRate * 0.005).max(1)
+    (0 until n).iterator.flatMap { i =>
+      val env = math.min(1.0, math.min(i, n - i) / fade)
+      val s =
+        (math.sin(2.0 * math.Pi * toneFreq * i / sampleRate) * env * Short.MaxValue * 0.4).toShort
+      Iterator((s & 0xff).toByte, ((s >> 8) & 0xff).toByte)
+    }.toArray
+
   def open(checkMuted: IO[Boolean])(using Raise[IO, AudioError]): Resource[IO, Handle] =
     for
       capture <- Resource.make(orRaise(IO.blocking {
@@ -100,39 +132,34 @@ object Audio:
 
   private def readFrame(line: TargetDataLine): Option[Array[Byte]] =
     val buf = new Array[Byte](frameBytes)
-    var off = 0
-    var live = true
-    while off < frameBytes && live do
-      val n = line.read(buf, off, frameBytes - off)
-      if n <= 0 then live = false else off += n
-    Option.when(off == frameBytes)(buf)
+    @annotation.tailrec
+    def fill(off: Int): Int =
+      if off >= frameBytes then off
+      else
+        val n = line.read(buf, off, frameBytes - off)
+        if n <= 0 then off else fill(off + n)
+    Option.when(fill(0) == frameBytes)(buf)
 
   private def rms(buf: Array[Byte]): Double =
-    var sum = 0.0
-    var i = 0
-    while i + 1 < buf.length do
-      val s = (((buf(i + 1) & 0xff) << 8) | (buf(i) & 0xff)).toShort
-      sum += s.toDouble * s.toDouble
-      i += 2
-    math.sqrt(sum / (buf.length / 2))
+    val samples = buf.length / 2
+    val sum = (0 until samples).foldLeft(0.0) { (acc, i) =>
+      val s = (((buf(i * 2 + 1) & 0xff) << 8) | (buf(i * 2) & 0xff)).toShort
+      acc + s.toDouble * s.toDouble
+    }
+    math.sqrt(sum / samples)
 
   private def decodeFrame(b64: String): Array[Short] =
     val bytes = Base64.getDecoder.decode(b64)
-    val out = new Array[Short](bytes.length / 2)
-    var i = 0
-    while i < out.length do
-      out(i) = (((bytes(i * 2 + 1) & 0xff) << 8) | (bytes(i * 2) & 0xff)).toShort
-      i += 1
-    out
+    Array.tabulate(bytes.length / 2) { i =>
+      (((bytes(i * 2 + 1) & 0xff) << 8) | (bytes(i * 2) & 0xff)).toShort
+    }
 
   private def mix(frames: List[Array[Short]]): Array[Byte] =
     val out = new Array[Byte](frameBytes)
-    var i = 0
-    while i < frameSamples do
-      var acc = 0
-      frames.foreach(f => if i < f.length then acc += f(i))
+    (0 until frameSamples).foreach { i =>
+      val acc = frames.foldLeft(0)((a, f) => if i < f.length then a + f(i) else a)
       val clamped = math.max(Short.MinValue.toInt, math.min(Short.MaxValue.toInt, acc))
       out(i * 2) = (clamped & 0xff).toByte
       out(i * 2 + 1) = ((clamped >> 8) & 0xff).toByte
-      i += 1
+    }
     out

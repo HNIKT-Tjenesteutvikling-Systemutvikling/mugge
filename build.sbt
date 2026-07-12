@@ -24,7 +24,7 @@ lazy val client = (project in file("client"))
   .enablePlugins(JavaAppPackaging)
   .settings(
     name := "client",
-    scalaVersion := "3.3.1",
+    scalaVersion := "3.3.8",
     semanticdbEnabled := true,
     semanticdbVersion := scalafixSemanticdb.revision,
     Compile / scalaSource := baseDirectory.value / "src",
