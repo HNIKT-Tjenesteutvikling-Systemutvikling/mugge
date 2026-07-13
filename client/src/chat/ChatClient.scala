@@ -38,7 +38,7 @@ object ChatClient extends IOApp:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  private val protocolVersion = 4
+  private val protocolVersion = 5
 
   private val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 
@@ -439,7 +439,7 @@ object ChatClient extends IOApp:
 
       tlsContext <- Network[IO].tlsContext.insecure
       connectOnce = Network[IO]
-        .client(SocketAddress(host, port))
+        .connect(SocketAddress(host, port))
         .use { rawSocket =>
           tlsContext.client(rawSocket).use { socket =>
             for

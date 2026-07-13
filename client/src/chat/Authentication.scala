@@ -44,6 +44,10 @@ object Authentication:
     case TurboNaepskrel extends AuthorizedUser("TurboNaepskrel")
     case LeifEggenfellner extends AuthorizedUser("leifeggenfellner")
 
+  // Hand-synced mirror of the server's AdminUser; not used at runtime here.
+  enum AdminUser(val githubUsername: String):
+    case Gako358 extends AdminUser("Gako358")
+
   case class AuthChallenge(challenge: String, signature: Option[String])
 
   private def raiseFromEither[A](e: Either[AuthError, A])(using r: Raise[IO, AuthError]): IO[A] =

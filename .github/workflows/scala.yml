@@ -28,7 +28,7 @@ jobs:
     outputs:
       scala_changed: ${{ steps.filter.outputs.scala_changed }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
@@ -58,8 +58,8 @@ jobs:
     needs: matrix
     if: needs.matrix.outputs.scala_changed == 'true'
     steps:
-      - uses: actions/checkout@v5
-      - uses: cachix/install-nix-action@v30
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 

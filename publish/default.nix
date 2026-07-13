@@ -34,7 +34,7 @@ rec {
     '';
 
     outputHashMode = "recursive";
-    outputHash = "sha256-6hHouTLWe8RJSqqrjfABbijOFaS7ScvYxTrjITim8Q4=";
+    outputHash = "sha256-9Zu4QCFGigtcv7pEczU29E+AN5L5CYQL99QeHV0cVn8=";
     outputHashAlgo = "sha256";
   };
 
@@ -77,6 +77,7 @@ rec {
       #!${pkgs.bash}/bin/bash
       export JAVA_HOME=${customJava}
       export PATH=${customJava}/bin:\$PATH
+      export JAVA_OPTS="\''${JAVA_OPTS:--Xmx256m}"
       exec $out/bin/.client-unwrapped "\$@"
       EOF
       chmod +x $out/bin/client $out/bin/.client-unwrapped
