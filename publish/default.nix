@@ -89,24 +89,18 @@ rec {
   muggeClient = pkgs.writeShellScriptBin "mugge" ''
     #!${pkgs.bash}/bin/bash
 
-    # Runtime tools the client shells out to: ssh-keygen, openssl (key
-    # conversion), git (username detection), notify-send (mentions).
     export PATH=${
       pkgs.lib.makeBinPath [
         pkgs.openssh
         pkgs.openssl
         pkgs.git
         pkgs.libnotify
+        pkgs.pipewire
       ]
     }:$PATH
 
-    # Voice chat: the JVM's javax.sound.sampled backend dlopen()s libasound at
-    # runtime, and alsa-plugins provides the PCM that routes ALSA's `default`
-    # device to the user's PipeWire/Pulse session. Without these on NixOS the
-    # /voice command can't open the mic or speaker.
     export LD_LIBRARY_PATH=${
       pkgs.lib.makeLibraryPath [
-        pkgs.alsa-lib
         pkgs.alsa-plugins
       ]
     }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}

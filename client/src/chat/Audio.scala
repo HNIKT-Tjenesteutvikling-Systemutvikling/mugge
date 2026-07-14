@@ -6,12 +6,14 @@ import cats.mtl.Raise
 import cats.syntax.all.*
 import fs2.Stream
 
+import java.io.ByteArrayInputStream
 import java.util.Base64
 import javax.sound.sampled.AudioFormat
 import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.SourceDataLine
 import javax.sound.sampled.TargetDataLine
 import scala.concurrent.duration.*
+import scala.sys.process.*
 
 object Audio:
   final case class AudioError(message: String)
@@ -87,29 +89,74 @@ object Audio:
   private val toneFreq = 880.0
   private val toneMillis = 120
   private val gapMillis = 60
+  private val toneRate = 44100
 
-  def playTone(critical: Boolean)(using Raise[IO, AudioError]): IO[Unit] =
-    val beep = toneBytes(toneMillis)
-    val gap = Array.fill[Byte]((sampleRate * gapMillis / 1000).toInt * 2)(0)
-    val buffers = if critical then List(beep, gap, beep) else List(beep)
-    orRaise(IO.blocking {
-      val line = AudioSystem.getSourceDataLine(format)
-      line.open(format, lineBufferBytes)
+  def playTone(critical: Boolean)(using r: Raise[IO, AudioError]): IO[Unit] =
+    playViaPipeWire(toneSequence(toneRate.toFloat, 1, critical)).flatMap {
+      case true  => IO.unit
+      case false => playViaJavaSound(critical)
+    }
+
+  private def playViaPipeWire(pcm: Array[Byte]): IO[Boolean] =
+    IO.blocking {
+      val cmd = Seq(
+        "pw-play",
+        "--format",
+        "s16",
+        "--rate",
+        toneRate.toString,
+        "--channels",
+        "1",
+        "--raw",
+        "-"
+      )
+      val quiet = ProcessLogger(_ => (), _ => ())
+      (Process(cmd) #< new ByteArrayInputStream(pcm)).!(quiet) == 0
+    }.handleError(_ => false)
+
+  private val toneFormats: List[AudioFormat] = List(
+    new AudioFormat(44100f, 16, 2, /*signed*/ true, /*bigEndian*/ false),
+    new AudioFormat(48000f, 16, 2, /*signed*/ true, /*bigEndian*/ false),
+    format
+  )
+
+  private def playViaJavaSound(critical: Boolean)(using r: Raise[IO, AudioError]): IO[Unit] =
+    toneFormats
+      .collectFirstSomeM(fmt => playToneWith(fmt, critical).attempt.map(_.toOption))
+      .flatMap {
+        case Some(_) => IO.unit
+        case None    => r.raise(AudioError("no audio output available for the alert tone"))
+      }
+
+  private def playToneWith(fmt: AudioFormat, critical: Boolean): IO[Unit] =
+    IO.blocking {
+      val line = AudioSystem.getSourceDataLine(fmt)
+      line.open(fmt)
       line.start()
-      buffers.foreach(b => line.write(b, 0, b.length))
+      val pcm = toneSequence(fmt.getSampleRate, fmt.getChannels, critical)
+      line.write(pcm, 0, pcm.length)
       line.drain()
       line.stop()
       line.close()
-    })
+    }
 
-  private def toneBytes(millis: Int): Array[Byte] =
-    val n = (sampleRate * millis / 1000).toInt
-    val fade = (sampleRate * 0.005).max(1)
+  private def toneSequence(sr: Float, channels: Int, critical: Boolean): Array[Byte] =
+    val beep = toneBytes(sr, channels, toneMillis)
+    if !critical then beep
+    else
+      val gap = new Array[Byte]((sr * gapMillis / 1000).toInt * channels * 2)
+      beep ++ gap ++ beep
+
+  private def toneBytes(sr: Float, channels: Int, millis: Int): Array[Byte] =
+    val n = (sr * millis / 1000).toInt
+    val fade = (sr * 0.005).max(1)
     (0 until n).iterator.flatMap { i =>
       val env = math.min(1.0, math.min(i, n - i) / fade)
       val s =
-        (math.sin(2.0 * math.Pi * toneFreq * i / sampleRate) * env * Short.MaxValue * 0.4).toShort
-      Iterator((s & 0xff).toByte, ((s >> 8) & 0xff).toByte)
+        (math.sin(2.0 * math.Pi * toneFreq * i / sr) * env * Short.MaxValue * 0.4).toShort
+      val lo = (s & 0xff).toByte
+      val hi = ((s >> 8) & 0xff).toByte
+      (0 until channels).iterator.flatMap(_ => Iterator(lo, hi))
     }.toArray
 
   def open(checkMuted: IO[Boolean])(using Raise[IO, AudioError]): Resource[IO, Handle] =

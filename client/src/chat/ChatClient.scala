@@ -1245,7 +1245,7 @@ object ChatClient extends IOApp:
   private def playNotificationSound(critical: Boolean): IO[Unit] =
     allow[Audio.AudioError] {
       Audio.playTone(critical)
-    }.rescue(err => logger.debug(s"[Notification Sound] ${err.message}"))
+    }.rescue(err => logger.warn(s"[Notification Sound] ${err.message}"))
 
   private def handleReminder(msg: String, myUsername: String, ui: Ui): IO[Unit] =
     // REMIND:<from>:<HH:MM>:<text> — text is last and may contain ':'.
