@@ -38,7 +38,7 @@ object ChatClient extends IOApp:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  private val protocolVersion = 5
+  private val protocolVersion = 6
 
   private val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 
