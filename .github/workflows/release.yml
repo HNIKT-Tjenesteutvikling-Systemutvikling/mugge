@@ -1,0 +1,111 @@
+# Builds a self-contained Linux client (bundled Temurin runtime, no JDK
+# needed on the user's machine) and attaches it to the GitHub Release.
+#
+# Windows is intentionally out of scope: Windows users run the Linux
+# build under WSL. Nix is used for dev + `nix flake check`, but not here:
+# nixpkgs JDKs are patched to the nix-store dynamic linker, so a runtime
+# bundled from nixpkgs would only run on machines that have that exact
+# store path. jpackage with a vanilla Temurin JDK yields a portable
+# artifact that runs on any glibc Linux.
+
+name: Release Linux client
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build Linux app-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Temurin 21 (full JDK, includes jpackage + jmods)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Stage the client
+        run: sbt -batch client/stage
+
+      - name: Package a self-contained app-image
+        run: |
+          set -euo pipefail
+
+          STAGE_DIR=$(find target -type d -path '*/client/universal/stage' | head -1)
+          if [ -z "$STAGE_DIR" ]; then
+            echo "::error::Could not locate the native-packager stage directory"
+            exit 1
+          fi
+          echo "Stage dir: $STAGE_DIR"
+
+          # The application jar is the one holding the entrypoint class.
+          MAIN_JAR=""
+          for jar in "$STAGE_DIR"/lib/*.jar; do
+            if unzip -l "$jar" | grep -q 'chat/ChatClient.class'; then
+              MAIN_JAR=$(basename "$jar")
+              break
+            fi
+          done
+          if [ -z "$MAIN_JAR" ]; then
+            echo "::error::Could not find the jar containing chat/ChatClient.class"
+            exit 1
+          fi
+          echo "Main jar: $MAIN_JAR"
+
+          # jpackage requires a numeric-leading version.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0"
+          fi
+          echo "Version: $VERSION"
+
+          rm -rf dist
+          jpackage \
+            --type app-image \
+            --name mugge \
+            --input "$STAGE_DIR/lib" \
+            --main-jar "$MAIN_JAR" \
+            --main-class chat.ChatClient \
+            --java-options -Xmx256m \
+            --app-version "$VERSION" \
+            --dest dist
+
+          # Convenience launcher that defaults to the hosted Azure server
+          # while still honouring CHAT_SERVER_HOST/PORT and positional args.
+          cat > dist/mugge/connect.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export CHAT_SERVER_HOST="${CHAT_SERVER_HOST:-mugge-chat-server.norwayeast.azurecontainer.io}"
+          export CHAT_SERVER_PORT="${CHAT_SERVER_PORT:-20222}"
+          exec "$DIR/bin/mugge" "$@"
+          EOF
+          chmod +x dist/mugge/connect.sh
+
+          tar czf mugge-linux-x64.tar.gz -C dist mugge
+          echo "Built artifact:"
+          ls -lh mugge-linux-x64.tar.gz
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mugge-linux-x64
+          path: mugge-linux-x64.tar.gz
+
+      - name: Attach to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mugge-linux-x64.tar.gz
+          fail_on_unmatched_files: true

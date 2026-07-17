@@ -27,3 +27,29 @@ To compile the code, run:
 #+begin_src nix-ts
   nix run .#client
 #+end_src
+
+* Download a prebuilt client (Linux)
+
+Every =vX.Y.Z= tag publishes a self-contained Linux client to the
+[[https://github.com/][GitHub Releases]] page. It bundles its own Java
+runtime, so *no JDK or nix is required* on the target machine — any
+64-bit glibc Linux works.
+
+#+begin_src shell
+  tar xzf mugge-linux-x64.tar.gz
+  ./mugge/connect.sh          # connects to the hosted Azure server
+#+end_src
+
+- =connect.sh= defaults =CHAT_SERVER_HOST= to the hosted Azure instance;
+  override the target with env vars or positional args:
+  #+begin_src shell
+    CHAT_SERVER_HOST=localhost CHAT_SERVER_PORT=20222 ./mugge/connect.sh
+    ./mugge/bin/mugge <host> <port>     # raw launcher, no Azure default
+  #+end_src
+- *Windows*: run the Linux build under [[https://learn.microsoft.com/windows/wsl/][WSL]].
+  There is no native Windows binary.
+- *Auth*: a provisioned machine auto-authenticates via its SSH key +
+  git =user.name=; everyone else joins as a guest. Ed25519 keys work
+  out of the box; RSA OpenSSH keys need =ssh-keygen= (and =openssl= for
+  the PKCS#1 path) on =PATH=.
+- *Voice* needs PipeWire/ALSA on the host; text chat works regardless.
