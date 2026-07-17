@@ -102,7 +102,6 @@ object ChatClient extends IOApp:
       if n > p && n < 4 then Some(n * 25) else None
 
   case class ClientState(
-      authenticated: Boolean = false,
       githubUsername: Option[String] = None,
       privateKey: Option[PrivateKey] = None,
       colors: Map[String, Int] = Map.empty,
@@ -177,11 +176,6 @@ object ChatClient extends IOApp:
 
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
-
-  private def isFromServer(msg: String): Boolean =
-    msg match
-      case displayPattern(_, _, sender, _) => sender.trim == "SERVER"
-      case _                               => false
 
   private def colorIndexFor(name: String, state: Ref[IO, ClientState]): IO[Int] =
     state.modify { st =>
@@ -682,7 +676,7 @@ object ChatClient extends IOApp:
       line == "VOICEJOIN" || line == "VOICELEAVE" || line.startsWith("VOICE:")
 
   private def sensitiveOutbound(line: String): Boolean =
-    line.startsWith("SIGNATURE:") || line.startsWith("/verify ") ||
+    line.startsWith("SIGNATURE:") ||
       line.startsWith("FILEDATA:") || line.startsWith("FILEEND:")
 
   private def rawMode(pty: Boolean): Resource[IO, Unit] =
@@ -727,8 +721,6 @@ object ChatClient extends IOApp:
               halt.complete(Right(())).void
           else if msg.startsWith("CHALLENGE:") then
             handleAutoChallenge(msg.drop(10), state, outgoingQueue)
-          else if msg.startsWith("Challenge: ") then
-            handleManualChallenge(msg.drop(11), state, outgoingQueue)
           else if msg.startsWith("USERS:") then
             val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setUsers(users)
@@ -757,10 +749,6 @@ object ChatClient extends IOApp:
           else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
           else if msg.startsWith("FILEDATA:") then handleFileData(msg, state, ui)
           else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
-          else if isFromServer(msg) && msg.contains("Authentication successful!") then
-            state.update(_.copy(authenticated = true)) >>
-              ui.printLine(msg) >>
-              ui.printLine("You can now start chatting!")
           else
             colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
               checkForMentions(msg, myUsername) >>
@@ -793,28 +781,6 @@ object ChatClient extends IOApp:
           logger.debug("Cannot auto-authenticate: missing private key or GitHub username.")
       }
     } yield ()
-
-  private def handleManualChallenge(
-      challenge: String,
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String]
-  ): IO[Unit] =
-    for
-      currentState <- state.get
-      _ <- currentState.privateKey match
-        case Some(privateKey) =>
-          allow[Authentication.AuthError] {
-            for
-              _ <- logger.debug(s"Received authentication challenge, auto-signing...")
-              signature <- Authentication.signChallenge(challenge, privateKey)
-              _ <- outgoingQueue.offer(s"/verify $signature")
-            yield ()
-          }.rescue { err =>
-            logger.warn(s"Could not sign challenge: ${err.message}")
-          }
-        case None =>
-          logger.error("Cannot sign challenge: SSH private key not loaded")
-    yield ()
 
   private def readFromUser(
       outgoingQueue: Queue[IO, String],
@@ -943,7 +909,6 @@ object ChatClient extends IOApp:
     "!remind",
     "!reminders",
     "/acceptfile",
-    "/auth",
     "/ban",
     "/help",
     "/kick",
@@ -951,7 +916,6 @@ object ChatClient extends IOApp:
     "/quit",
     "/rejectfile",
     "/sendfile",
-    "/verify",
     "/voice",
     "/voicetest"
   )
