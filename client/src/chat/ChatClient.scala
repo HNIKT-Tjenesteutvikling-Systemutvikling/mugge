@@ -102,6 +102,7 @@ object ChatClient extends IOApp:
       if n > p && n < 4 then Some(n * 25) else None
 
   case class ClientState(
+      username: String = "",
       githubUsername: Option[String] = None,
       privateKey: Option[PrivateKey] = None,
       colors: Map[String, Int] = Map.empty,
@@ -440,10 +441,11 @@ object ChatClient extends IOApp:
               _ <- IO.println(s"Connected to chat server at $host:$port")
               state <- Ref.of[IO, ClientState](
                 ClientState(
+                  username = myUsername,
                   githubUsername = githubUsername
                 )
               )
-              outcome <- handleConnection(socket, myUsername, state)
+              outcome <- handleConnection(socket, state)
             yield outcome
           }
         }
@@ -492,7 +494,6 @@ object ChatClient extends IOApp:
 
   private def handleConnection(
       socket: Socket[IO],
-      myUsername: String,
       state: Ref[IO, ClientState]
   ): IO[SessionOutcome] = {
     val initialDataIO: IO[String] = for {
@@ -575,7 +576,6 @@ object ChatClient extends IOApp:
       val serverReader: Stream[IO, Unit] =
         readFromServer(
           socket,
-          myUsername,
           state,
           outgoingQueue,
           ui,
@@ -699,7 +699,6 @@ object ChatClient extends IOApp:
 
   private def readFromServer(
       socket: Socket[IO],
-      myUsername: String,
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String],
       ui: Ui,
@@ -713,7 +712,8 @@ object ChatClient extends IOApp:
       .through(text.lines)
       .filter(_.nonEmpty)
       .evalMap { msg =>
-        IO.monotonic.flatMap(lastReceived.set) *> {
+        IO.monotonic.flatMap(lastReceived.set) *> state.get.flatMap { st =>
+          val me = st.username
           if msg == "PONG" then IO.unit
           else if msg.startsWith("INCOMPATIBLE:") then
             incompatible.set(true) *>
@@ -721,6 +721,10 @@ object ChatClient extends IOApp:
               halt.complete(Right(())).void
           else if msg.startsWith("CHALLENGE:") then
             handleAutoChallenge(msg.drop(10), state, outgoingQueue)
+          else if msg.startsWith("NICK:") then
+            val newName = msg.drop("NICK:".length).trim
+            state.update(_.copy(username = newName)) *>
+              ui.printLine(s"${serverColor}You are now known as $newName$ansiReset")
           else if msg.startsWith("USERS:") then
             val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setUsers(users)
@@ -730,7 +734,7 @@ object ChatClient extends IOApp:
               .split(",")
               .map(_.trim)
               .filter(_.nonEmpty)
-              .filterNot(_.equalsIgnoreCase(myUsername))
+              .filterNot(_.equalsIgnoreCase(me))
               .toList
             ui.setTyping(users)
           else if msg.startsWith("VOICEUSERS:") then
@@ -742,7 +746,7 @@ object ChatClient extends IOApp:
               case Array(_, from, _, b64) =>
                 voiceRef.get.flatMap(_.traverse_(_.handle.receive(from, b64)))
               case _ => IO.unit
-          else if msg.startsWith("REMIND:") then handleReminder(msg, myUsername, ui)
+          else if msg.startsWith("REMIND:") then handleReminder(msg, me, ui)
           else if msg.startsWith("FILEOFFER:") then handleFileOffer(msg, state, ui)
           else if msg.startsWith("FILEACCEPT:") then
             handleFileAccept(msg.drop(11).trim, state, outgoingQueue, ui)
@@ -751,8 +755,8 @@ object ChatClient extends IOApp:
           else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
           else
             colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
-              checkForMentions(msg, myUsername) >>
-              checkForPings(msg, myUsername, state)
+              checkForMentions(msg, me) >>
+              checkForPings(msg, me, state)
         }
       }
       .drain
@@ -913,6 +917,7 @@ object ChatClient extends IOApp:
     "/help",
     "/kick",
     "/mute",
+    "/nick",
     "/quit",
     "/rejectfile",
     "/sendfile",
