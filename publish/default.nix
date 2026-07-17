@@ -144,4 +144,22 @@ rec {
 
     exec ${muggeClient}/bin/mugge
   '';
+
+  # stdio TRAMP bridge: no banner, no output on stdout (shell channel only).
+  muggeBridge = pkgs.writeShellScriptBin "mugge-bridge" ''
+    #!${pkgs.bash}/bin/bash
+
+    export PATH=${
+      pkgs.lib.makeBinPath [
+        pkgs.openssh
+        pkgs.openssl
+        pkgs.git
+      ]
+    }:$PATH
+
+    export CHAT_SERVER_HOST="''${CHAT_SERVER_HOST:-mugge-chat-server.norwayeast.azurecontainer.io}"
+    export CHAT_SERVER_PORT="''${CHAT_SERVER_PORT:-20222}"
+
+    exec ${clientBuild}/bin/mugge-client --assist "$@"
+  '';
 }

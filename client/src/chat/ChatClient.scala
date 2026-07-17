@@ -13,6 +13,7 @@ import fs2.*
 import fs2.io.file.Files as Fs2Files
 import fs2.io.file.Path as Fs2Path
 import fs2.io.net.*
+import fs2.io.process.ProcessBuilder
 import org.typelevel.log4cats.Logger as TLogger
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
@@ -41,6 +42,8 @@ object ChatClient extends IOApp:
   private val protocolVersion = 6
 
   private val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
+
+  private val noAssist: Boolean = sys.env.get("MUGGE_NO_ASSIST").contains("1")
 
   private val quitHint =
     "/quit is disabled here — this chat runs in the background. Press Ctrl-\\ " +
@@ -113,10 +116,13 @@ object ChatClient extends IOApp:
       pingHistory: Map[String, List[FiniteDuration]] = Map.empty,
       inVoice: Boolean = false,
       muted: Boolean = false,
-      voiceUsers: List[String] = Nil
+      voiceUsers: List[String] = Nil,
+      assistSessions: Map[String, AssistSession] = Map.empty
   )
 
   private case class Voice(handle: Audio.Handle, teardown: IO[Unit])
+
+  case class AssistSession(stdinQueue: Queue[IO, Chunk[Byte]], teardown: IO[Unit])
 
   private enum SessionOutcome:
     case Quit, Incompatible, Lost, ConnectFailed
@@ -407,6 +413,15 @@ object ChatClient extends IOApp:
       s"\u001b7$clears$header$entries\u001b8"
 
   def run(args: List[String]): IO[ExitCode] =
+    args.indexOf("--assist") match
+      case idx if idx >= 0 =>
+        args.lift(idx + 1) match
+          case Some(target) => runBridge(target)
+          case None =>
+            Console[IO].errorln("Usage: mugge-client --assist <user>").as(ExitCode.Error)
+      case _ => runInteractive(args)
+
+  private def runInteractive(args: List[String]): IO[ExitCode] =
     val host = args.headOption
       .flatMap(Host.fromString)
       .orElse(sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString))
@@ -459,6 +474,117 @@ object ChatClient extends IOApp:
         }
       exitCode <- reconnectLoop(connectOnce, reconnectInitialBackoff)
     yield exitCode
+
+  private def runBridge(target: String): IO[ExitCode] =
+    val host = sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString).getOrElse(defaultHost)
+    val port = sys.env.get("CHAT_SERVER_PORT").flatMap(Port.fromString).getOrElse(defaultPort)
+    for
+      githubUsername <- allow[Authentication.AuthError] {
+        Authentication.detectGithubUsername()
+      }.rescue(_ => IO.pure(None))
+      privateKey <- allow[Authentication.AuthError] {
+        Authentication.loadPrivateKey().map(_.some)
+      }.rescue(_ => IO.pure(None))
+      code <- (githubUsername, privateKey) match
+        case (Some(gh), Some(key)) =>
+          Network[IO].tlsContext.insecure
+            .flatMap { tls =>
+              Network[IO]
+                .connect(SocketAddress(host, port))
+                .use(raw => tls.client(raw).use(socket => bridgeSession(socket, gh, key, target)))
+            }
+            .handleErrorWith { err =>
+              logger.error(s"Bridge connection failed: ${err.getMessage}").as(ExitCode.Error)
+            }
+        case _ =>
+          logger
+            .error("Bridge requires a GitHub username and SSH key (admin machine).")
+            .as(ExitCode.Error)
+    yield code
+
+  private def bridgeSession(
+      socket: Socket[IO],
+      githubUsername: String,
+      privateKey: PrivateKey,
+      target: String
+  ): IO[ExitCode] =
+    for
+      hostname <- getHostname
+      outQ <- Queue.unbounded[IO, String]
+      done <- Deferred[IO, ExitCode]
+      stdinFib <- Ref.of[IO, Option[Fiber[IO, Throwable, Unit]]](None)
+      _ <- outQ.offer(
+        s"$hostname\nproto:$protocolVersion\nauto-auth:$githubUsername\nassist-bridge:1\n\n"
+      )
+      writer = Stream
+        .fromQueueUnterminated(outQ)
+        .through(text.utf8.encode)
+        .through(socket.writes)
+      reader = socket.reads
+        .through(text.utf8.decode)
+        .through(text.lines)
+        .filter(_.nonEmpty)
+        .evalMap(line => bridgeLine(line, outQ, done, stdinFib, privateKey, target))
+        .onFinalize(done.complete(ExitCode.Error).attempt.void)
+      pumps <- Stream(reader.drain, writer.drain).parJoinUnbounded.compile.drain.start
+      code <- done.get
+        .guarantee(pumps.cancel *> stdinFib.get.flatMap(_.traverse_(_.cancel)))
+    yield code
+
+  private def bridgeLine(
+      line: String,
+      outQ: Queue[IO, String],
+      done: Deferred[IO, ExitCode],
+      stdinFib: Ref[IO, Option[Fiber[IO, Throwable, Unit]]],
+      privateKey: PrivateKey,
+      target: String
+  ): IO[Unit] =
+    if line.startsWith("CHALLENGE:") then
+      allow[Authentication.AuthError] {
+        Authentication
+          .signChallenge(line.drop("CHALLENGE:".length), privateKey)
+          .flatMap(sig => outQ.offer(s"SIGNATURE:$sig\n"))
+      }.rescue { err =>
+        logger.error(s"Bridge auth signing failed: ${err.message}") *>
+          done.complete(ExitCode.Error).void
+      }
+    else if line == "ASSISTREADY" then outQ.offer(s"ASSIST:$target\n")
+    else if line.startsWith("ASSISTOK:") then
+      startBridgePump(line.drop("ASSISTOK:".length).trim, outQ, done, stdinFib)
+    else if line.startsWith("ASSISTERR:") then
+      logger.error(s"Assist refused: ${line.drop("ASSISTERR:".length).trim}") *>
+        done.complete(ExitCode.Error).void
+    else if line.startsWith("ASSISTDATA:") then
+      line.split(":", 3) match
+        case Array(_, _, b64) => IO(Base64.getDecoder.decode(b64)).flatMap(writeStdout)
+        case _                => IO.unit
+    else if line.startsWith("ASSISTEND:") then done.complete(ExitCode.Success).void
+    else if line.startsWith("INCOMPATIBLE:") then
+      Console[IO].errorln(line.drop("INCOMPATIBLE:".length)) *> done.complete(ExitCode.Error).void
+    else IO.unit
+
+  private def startBridgePump(
+      id: String,
+      outQ: Queue[IO, String],
+      done: Deferred[IO, ExitCode],
+      stdinFib: Ref[IO, Option[Fiber[IO, Throwable, Unit]]]
+  ): IO[Unit] =
+    fs2.io
+      .stdin[IO](64 * 1024)
+      .chunks
+      .evalMap(chunk =>
+        outQ.offer(s"ASSISTDATA:$id:${Base64.getEncoder.encodeToString(chunk.toArray)}")
+      )
+      .compile
+      .drain
+      .flatMap(_ => outQ.offer(s"ASSISTEND:$id") *> done.complete(ExitCode.Success).void)
+      .attempt
+      .void
+      .start
+      .flatMap(fib => stdinFib.set(Some(fib)))
+
+  private def writeStdout(bytes: Array[Byte]): IO[Unit] =
+    IO.blocking { System.out.write(bytes); System.out.flush() }
 
   private def reconnectLoop(
       connectOnce: IO[SessionOutcome],
@@ -656,7 +782,14 @@ object ChatClient extends IOApp:
             .interruptWhen(halt)
             .compile
             .drain
-            .guarantee(voiceRef.getAndSet(None).flatMap(_.traverse_(_.teardown)))
+            .guarantee(
+              voiceRef.getAndSet(None).flatMap(_.traverse_(_.teardown)) *>
+                state
+                  .modify(st =>
+                    (st.copy(assistSessions = Map.empty), st.assistSessions.values.toList)
+                  )
+                  .flatMap(_.traverse_(_.teardown))
+            )
             .handleErrorWith { err =>
               connectionLost.set(true) *>
                 logger
@@ -677,7 +810,8 @@ object ChatClient extends IOApp:
 
   private def sensitiveOutbound(line: String): Boolean =
     line.startsWith("SIGNATURE:") ||
-      line.startsWith("FILEDATA:") || line.startsWith("FILEEND:")
+      line.startsWith("FILEDATA:") || line.startsWith("FILEEND:") ||
+      line.startsWith("ASSISTDATA:")
 
   private def rawMode(pty: Boolean): Resource[IO, Unit] =
     if !pty then Resource.unit[IO]
@@ -753,6 +887,9 @@ object ChatClient extends IOApp:
           else if msg.startsWith("FILEREJECT:") then handleFileReject(msg.drop(11).trim, state, ui)
           else if msg.startsWith("FILEDATA:") then handleFileData(msg, state, ui)
           else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
+          else if msg.startsWith("ASSISTDATA:") then handleAssistData(msg, state)
+          else if msg.startsWith("ASSISTEND:") then handleAssistEnd(msg, state, ui)
+          else if msg.startsWith("ASSIST:") then handleAssistStart(msg, state, outgoingQueue, ui)
           else
             colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
               checkForMentions(msg, me) >>
@@ -1228,6 +1365,95 @@ object ChatClient extends IOApp:
         ui.printLine(line) *>
           sendNotification(title, text, urgency = "critical", timeout = 0)
       case _ => IO.unit
+
+  private def handleAssistStart(
+      msg: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    msg.split(":", 3) match
+      case Array(_, id, adminName) =>
+        if noAssist then
+          ui.printLine(
+            s"$serverColor⚠ Refused Emacs assist from $adminName (MUGGE_NO_ASSIST).$ansiReset"
+          ) *> outgoingQueue.offer(s"ASSISTEND:$id:refused")
+        else startAssist(id, adminName, state, outgoingQueue, ui)
+      case _ => IO.unit
+
+  private def startAssist(
+      id: String,
+      adminName: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    for
+      _ <- ui.printLine(
+        s"$serverColor⚠ Admin $adminName has connected to your machine (Emacs assist)$ansiReset"
+      )
+      _ <- sendNotification(
+        title = "⚠ Admin assist",
+        body = s"$adminName connected to your machine (Emacs assist)",
+        urgency = "critical",
+        timeout = 0
+      )
+      stdinQ <- Queue.unbounded[IO, Chunk[Byte]]
+      spawned <- ProcessBuilder("/bin/sh").spawn[IO].allocated
+      (process, release) = spawned
+      inFib <- Stream
+        .fromQueueUnterminated(stdinQ)
+        .flatMap(Stream.chunk)
+        .through(process.stdin)
+        .compile
+        .drain
+        .attempt
+        .void
+        .start
+      outFib <- process.stdout
+        .merge(process.stderr)
+        .chunks
+        .evalMap { chunk =>
+          outgoingQueue.offer(s"ASSISTDATA:$id:${Base64.getEncoder.encodeToString(chunk.toArray)}")
+        }
+        .compile
+        .drain
+        .flatMap(_ =>
+          outgoingQueue.offer(s"ASSISTEND:$id:exited") *>
+            ui.printLine(s"${serverColor}Admin assist session ended.$ansiReset")
+        )
+        .guarantee(
+          state.update(st => st.copy(assistSessions = st.assistSessions - id)) *>
+            inFib.cancel *> release.attempt.void
+        )
+        .start
+      teardown = outFib.cancel *> inFib.cancel *> release.attempt.void
+      _ <- state.update(st =>
+        st.copy(assistSessions = st.assistSessions + (id -> AssistSession(stdinQ, teardown)))
+      )
+    yield ()
+
+  private def handleAssistData(msg: String, state: Ref[IO, ClientState]): IO[Unit] =
+    msg.split(":", 3) match
+      case Array(_, id, b64) =>
+        state.get.map(_.assistSessions.get(id)).flatMap {
+          case None => IO.unit
+          case Some(sess) =>
+            IO(Base64.getDecoder.decode(b64)).flatMap(bytes =>
+              sess.stdinQueue.offer(Chunk.array(bytes))
+            )
+        }
+      case _ => IO.unit
+
+  private def handleAssistEnd(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
+    val id = msg.split(":", 3).lift(1).getOrElse("")
+    state
+      .modify(st => (st.copy(assistSessions = st.assistSessions - id), st.assistSessions.get(id)))
+      .flatMap {
+        case None => IO.unit
+        case Some(sess) =>
+          sess.teardown *> ui.printLine(s"${serverColor}Admin assist session ended.$ansiReset")
+      }
 
   private def prepareSendFile(
       rest: String,

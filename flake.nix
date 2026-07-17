@@ -83,6 +83,7 @@
             client = publishConfig.clientBuild;
             mugge = publishConfig.muggeClient;
             mugge-azure = publishConfig.muggeAzure;
+            mugge-bridge = publishConfig.muggeBridge;
             default = publishConfig.muggeClient;
           };
 
