@@ -526,7 +526,8 @@ object ChatClient extends IOApp:
         .filter(_.nonEmpty)
         .evalMap(line => bridgeLine(line, outQ, done, stdinFib, privateKey, target))
         .onFinalize(done.complete(ExitCode.Error).attempt.void)
-      pumps <- Stream(reader.drain, writer.drain).parJoinUnbounded.compile.drain.start
+      pinger = Stream.awakeEvery[IO](pingInterval).evalMap(_ => outQ.offer("PING\n"))
+      pumps <- Stream(reader.drain, writer.drain, pinger.drain).parJoinUnbounded.compile.drain.start
       code <- done.get
         .guarantee(pumps.cancel *> stdinFib.get.flatMap(_.traverse_(_.cancel)))
     yield code
@@ -573,11 +574,11 @@ object ChatClient extends IOApp:
       .stdin[IO](64 * 1024)
       .chunks
       .evalMap(chunk =>
-        outQ.offer(s"ASSISTDATA:$id:${Base64.getEncoder.encodeToString(chunk.toArray)}")
+        outQ.offer(s"ASSISTDATA:$id:${Base64.getEncoder.encodeToString(chunk.toArray)}\n")
       )
       .compile
       .drain
-      .flatMap(_ => outQ.offer(s"ASSISTEND:$id") *> done.complete(ExitCode.Success).void)
+      .flatMap(_ => outQ.offer(s"ASSISTEND:$id\n") *> done.complete(ExitCode.Success).void)
       .attempt
       .void
       .start
@@ -1398,9 +1399,32 @@ object ChatClient extends IOApp:
         urgency = "critical",
         timeout = 0
       )
+      // pty via `script`: TRAMP hangs on a piped /bin/sh (no prompt, no stty).
+      // SHELL pinned because `script -c` runs the command via $SHELL (fish here).
+      spawned <- ProcessBuilder("script", "-qfc", "/bin/sh -i", "/dev/null")
+        .withExtraEnv(Map("SHELL" -> "/bin/sh"))
+        .spawn[IO]
+        .allocated
+        .attempt
+      _ <- spawned match
+        case Left(err) =>
+          logger.warn(s"Assist shell spawn failed: ${err.getMessage}") *>
+            outgoingQueue.offer(s"ASSISTEND:$id:spawn-failed") *>
+            ui.printLine(s"${serverColor}Admin assist session failed to start.$ansiReset")
+        case Right((process, release)) =>
+          pumpAssistShell(id, process, release, state, outgoingQueue, ui)
+    yield ()
+
+  private def pumpAssistShell(
+      id: String,
+      process: fs2.io.process.Process[IO],
+      release: IO[Unit],
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    for
       stdinQ <- Queue.unbounded[IO, Chunk[Byte]]
-      spawned <- ProcessBuilder("/bin/sh").spawn[IO].allocated
-      (process, release) = spawned
       inFib <- Stream
         .fromQueueUnterminated(stdinQ)
         .flatMap(Stream.chunk)

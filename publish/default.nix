@@ -96,6 +96,7 @@ rec {
         pkgs.git
         pkgs.libnotify
         pkgs.pipewire
+        pkgs.util-linux
       ]
     }:$PATH
 
