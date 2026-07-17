@@ -10,7 +10,7 @@ object UserMapping:
       case "grindstein"     => "Torkil"
       case "ievensen"       => "Harstad"
       case "intervbs"       => "Joran"
-      case "jca"            => "Svensken"
+      case "jca"            => "Jan-Olov"
       case "neethan"        => "Neethan"
       case "sigubrat"       => "Sigurd"
       case "williams"       => "Sigurd"
