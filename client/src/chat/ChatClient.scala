@@ -414,13 +414,20 @@ object ChatClient extends IOApp:
       s"\u001b7$clears$header$entries\u001b8"
 
   def run(args: List[String]): IO[ExitCode] =
-    args.indexOf("--assist") match
+    args.indexOf("--assist-test") match
       case idx if idx >= 0 =>
         args.lift(idx + 1) match
-          case Some(target) => runBridge(target)
+          case Some(target) => runBridge(target, quiet = true)
           case None =>
-            Console[IO].errorln("Usage: mugge-client --assist <user>").as(ExitCode.Error)
-      case _ => runInteractive(args)
+            Console[IO].errorln("Usage: mugge-client --assist-test <user>").as(ExitCode.Error)
+      case _ =>
+        args.indexOf("--assist") match
+          case idx if idx >= 0 =>
+            args.lift(idx + 1) match
+              case Some(target) => runBridge(target, quiet = false)
+              case None =>
+                Console[IO].errorln("Usage: mugge-client --assist <user>").as(ExitCode.Error)
+          case _ => runInteractive(args)
 
   private def runInteractive(args: List[String]): IO[ExitCode] =
     val host = args.headOption
@@ -476,7 +483,7 @@ object ChatClient extends IOApp:
       exitCode <- reconnectLoop(connectOnce, reconnectInitialBackoff)
     yield exitCode
 
-  private def runBridge(target: String): IO[ExitCode] =
+  private def runBridge(target: String, quiet: Boolean): IO[ExitCode] =
     val host = sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString).getOrElse(defaultHost)
     val port = sys.env.get("CHAT_SERVER_PORT").flatMap(Port.fromString).getOrElse(defaultPort)
     for
@@ -492,7 +499,9 @@ object ChatClient extends IOApp:
             .flatMap { tls =>
               Network[IO]
                 .connect(SocketAddress(host, port))
-                .use(raw => tls.client(raw).use(socket => bridgeSession(socket, gh, key, target)))
+                .use(raw =>
+                  tls.client(raw).use(socket => bridgeSession(socket, gh, key, target, quiet))
+                )
             }
             .handleErrorWith { err =>
               logger.error(s"Bridge connection failed: ${err.getMessage}").as(ExitCode.Error)
@@ -507,7 +516,8 @@ object ChatClient extends IOApp:
       socket: Socket[IO],
       githubUsername: String,
       privateKey: PrivateKey,
-      target: String
+      target: String,
+      quiet: Boolean
   ): IO[ExitCode] =
     for
       hostname <- getHostname
@@ -525,7 +535,7 @@ object ChatClient extends IOApp:
         .through(text.utf8.decode)
         .through(text.lines)
         .filter(_.nonEmpty)
-        .evalMap(line => bridgeLine(line, outQ, done, stdinFib, privateKey, target))
+        .evalMap(line => bridgeLine(line, outQ, done, stdinFib, privateKey, target, quiet))
         .onFinalize(done.complete(ExitCode.Error).attempt.void)
       pinger = Stream.awakeEvery[IO](pingInterval).evalMap(_ => outQ.offer("PING\n"))
       pumps <- Stream(reader.drain, writer.drain, pinger.drain).parJoinUnbounded.compile.drain.start
@@ -539,7 +549,8 @@ object ChatClient extends IOApp:
       done: Deferred[IO, ExitCode],
       stdinFib: Ref[IO, Option[Fiber[IO, Throwable, Unit]]],
       privateKey: PrivateKey,
-      target: String
+      target: String,
+      quiet: Boolean
   ): IO[Unit] =
     if line.startsWith("CHALLENGE:") then
       allow[Authentication.AuthError] {
@@ -550,7 +561,8 @@ object ChatClient extends IOApp:
         logger.error(s"Bridge auth signing failed: ${err.message}") *>
           done.complete(ExitCode.Error).void
       }
-    else if line == "ASSISTREADY" then outQ.offer(s"ASSIST:$target\n")
+    else if line == "ASSISTREADY" then
+      outQ.offer(if quiet then s"ASSISTTEST:$target\n" else s"ASSIST:$target\n")
     else if line.startsWith("ASSISTOK:") then
       startBridgePump(line.drop("ASSISTOK:".length).trim, outQ, done, stdinFib)
     else if line.startsWith("ASSISTERR:") then
@@ -893,7 +905,10 @@ object ChatClient extends IOApp:
           else if msg.startsWith("ASSISTEND:") then handleAssistEnd(msg, state, ui)
           else if msg.startsWith("ASSISTREQ:") then
             handleAssistConsentRequest(msg, state, outgoingQueue, ui)
-          else if msg.startsWith("ASSIST:") then handleAssistStart(msg, state, outgoingQueue, ui)
+          else if msg.startsWith("ASSISTQUIET:") then
+            handleAssistStart(msg, state, outgoingQueue, ui, quiet = true)
+          else if msg.startsWith("ASSIST:") then
+            handleAssistStart(msg, state, outgoingQueue, ui, quiet = false)
           else
             colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
               checkForMentions(msg, me) >>
@@ -1427,7 +1442,8 @@ object ChatClient extends IOApp:
       msg: String,
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String],
-      ui: Ui
+      ui: Ui,
+      quiet: Boolean
   ): IO[Unit] =
     msg.split(":", 3) match
       case Array(_, id, adminName) =>
@@ -1435,7 +1451,7 @@ object ChatClient extends IOApp:
           ui.printLine(
             s"$serverColor⚠ Refused Emacs assist from $adminName (MUGGE_NO_ASSIST).$ansiReset"
           ) *> outgoingQueue.offer(s"ASSISTEND:$id:refused")
-        else startAssist(id, adminName, state, outgoingQueue, ui)
+        else startAssist(id, adminName, state, outgoingQueue, ui, quiet)
       case _ => IO.unit
 
   private def startAssist(
@@ -1443,17 +1459,22 @@ object ChatClient extends IOApp:
       adminName: String,
       state: Ref[IO, ClientState],
       outgoingQueue: Queue[IO, String],
-      ui: Ui
+      ui: Ui,
+      quiet: Boolean
   ): IO[Unit] =
     for
       _ <- ui.printLine(
-        s"$serverColor⚠ Admin $adminName has connected to your machine (Emacs assist)$ansiReset"
+        if quiet then s"${serverColor}Emacs assist (test) session started for $adminName.$ansiReset"
+        else
+          s"$serverColor⚠ Admin $adminName has connected to your machine (Emacs assist)$ansiReset"
       )
-      _ <- sendNotification(
-        title = "⚠ Admin assist",
-        body = s"$adminName connected to your machine (Emacs assist)",
-        urgency = "critical",
-        timeout = 0
+      _ <- IO.whenA(!quiet)(
+        sendNotification(
+          title = "⚠ Admin assist",
+          body = s"$adminName connected to your machine (Emacs assist)",
+          urgency = "critical",
+          timeout = 0
+        )
       )
       // pty via `script`: TRAMP hangs on a piped /bin/sh (no prompt, no stty).
       // SHELL pinned because `script -c` runs the command via $SHELL (fish here).

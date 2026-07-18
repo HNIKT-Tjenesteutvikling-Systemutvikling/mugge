@@ -84,6 +84,7 @@
             mugge = publishConfig.muggeClient;
             mugge-azure = publishConfig.muggeAzure;
             mugge-bridge = publishConfig.muggeBridge;
+            mugge-bridge-test = publishConfig.muggeBridgeTest;
             default = publishConfig.muggeClient;
           };
 
