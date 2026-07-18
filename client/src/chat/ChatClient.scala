@@ -117,7 +117,8 @@ object ChatClient extends IOApp:
       inVoice: Boolean = false,
       muted: Boolean = false,
       voiceUsers: List[String] = Nil,
-      assistSessions: Map[String, AssistSession] = Map.empty
+      assistSessions: Map[String, AssistSession] = Map.empty,
+      pendingAssist: List[(String, String)] = Nil
   )
 
   private case class Voice(handle: Audio.Handle, teardown: IO[Unit])
@@ -890,6 +891,8 @@ object ChatClient extends IOApp:
           else if msg.startsWith("FILEEND:") then handleFileEnd(msg, state, ui)
           else if msg.startsWith("ASSISTDATA:") then handleAssistData(msg, state)
           else if msg.startsWith("ASSISTEND:") then handleAssistEnd(msg, state, ui)
+          else if msg.startsWith("ASSISTREQ:") then
+            handleAssistConsentRequest(msg, state, outgoingQueue, ui)
           else if msg.startsWith("ASSIST:") then handleAssistStart(msg, state, outgoingQueue, ui)
           else
             colorizeForDisplay(msg, state).flatMap(ui.printLine) >>
@@ -1151,6 +1154,8 @@ object ChatClient extends IOApp:
     else if line == "/voice" then toggleVoice(state, outgoingQueue, ui, voiceRef)
     else if line == "/voicetest" then toggleVoiceTest(state, outgoingQueue, ui, voiceRef)
     else if line == "/mute" then toggleMute(state, ui, voiceRef)
+    else if line.equalsIgnoreCase("yes") || line.equalsIgnoreCase("no") then
+      answerAssistConsent(line.equalsIgnoreCase("yes"), line, state, outgoingQueue, ui)
     else if line.startsWith("/") then outgoingQueue.offer(line)
     else outgoingQueue.offer(Emoji.expand(line))
 
@@ -1367,6 +1372,57 @@ object ChatClient extends IOApp:
           sendNotification(title, text, urgency = "critical", timeout = 0)
       case _ => IO.unit
 
+  private def handleAssistConsentRequest(
+      msg: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    msg.split(":", 3) match
+      case Array(_, id, adminName) =>
+        if noAssist then
+          ui.printLine(
+            s"$serverColor⚠ Refused Emacs assist from $adminName (MUGGE_NO_ASSIST).$ansiReset"
+          ) *> outgoingQueue.offer(s"ASSISTDENY:$id")
+        else
+          state.update(st => st.copy(pendingAssist = st.pendingAssist :+ (id, adminName))) *>
+            ui.printLine(
+              s"$serverColor⚠ Admin $adminName wants to connect to your machine (Emacs assist). " +
+                s"Type yes to allow or no to deny.$ansiReset"
+            ) *>
+            sendNotification(
+              title = "⚠ Admin assist request",
+              body = s"$adminName wants to connect to your machine — answer yes or no in the chat",
+              urgency = "critical",
+              timeout = 0
+            )
+      case _ => IO.unit
+
+  private def answerAssistConsent(
+      approve: Boolean,
+      raw: String,
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String],
+      ui: Ui
+  ): IO[Unit] =
+    state
+      .modify { st =>
+        st.pendingAssist match
+          case answered :: rest => (st.copy(pendingAssist = rest), Some(answered))
+          case Nil              => (st, None)
+      }
+      .flatMap {
+        // No pending request: yes/no is just chat.
+        case None => outgoingQueue.offer(Emoji.expand(raw))
+        case Some((id, adminName)) =>
+          if approve then
+            outgoingQueue.offer(s"ASSISTACCEPT:$id") *>
+              ui.printLine(s"${serverColor}Approved Emacs assist from $adminName.$ansiReset")
+          else
+            outgoingQueue.offer(s"ASSISTDENY:$id") *>
+              ui.printLine(s"${serverColor}Denied Emacs assist from $adminName.$ansiReset")
+      }
+
   private def handleAssistStart(
       msg: String,
       state: Ref[IO, ClientState],
@@ -1472,11 +1528,22 @@ object ChatClient extends IOApp:
   private def handleAssistEnd(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
     val id = msg.split(":", 3).lift(1).getOrElse("")
     state
-      .modify(st => (st.copy(assistSessions = st.assistSessions - id), st.assistSessions.get(id)))
+      .modify { st =>
+        val pending = st.pendingAssist.find(_._1 == id)
+        val updated = st.copy(
+          assistSessions = st.assistSessions - id,
+          pendingAssist = st.pendingAssist.filterNot(_._1 == id)
+        )
+        (updated, (st.assistSessions.get(id), pending))
+      }
       .flatMap {
-        case None => IO.unit
-        case Some(sess) =>
+        case (Some(sess), _) =>
           sess.teardown *> ui.printLine(s"${serverColor}Admin assist session ended.$ansiReset")
+        case (None, Some((_, adminName))) =>
+          ui.printLine(
+            s"${serverColor}Assist request from $adminName was cancelled.$ansiReset"
+          )
+        case _ => IO.unit
       }
 
   private def prepareSendFile(
