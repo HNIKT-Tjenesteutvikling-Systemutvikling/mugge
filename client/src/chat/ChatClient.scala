@@ -861,6 +861,10 @@ object ChatClient extends IOApp:
             val newName = msg.drop("NICK:".length).trim
             state.update(_.copy(username = newName)) *>
               ui.printLine(s"${serverColor}You are now known as $newName$ansiReset")
+          // Replayed history renders like chat but must not re-fire
+          // mention/ping notifications.
+          else if msg.startsWith("HIST:") then
+            colorizeForDisplay(msg.drop("HIST:".length), state).flatMap(ui.printLine)
           else if msg.startsWith("USERS:") then
             val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setUsers(users)
