@@ -163,21 +163,4 @@ rec {
 
     exec ${clientBuild}/bin/mugge-client --assist "$@"
   '';
-
-  muggeBridgeTest = pkgs.writeShellScriptBin "mugge-bridge-test" ''
-    #!${pkgs.bash}/bin/bash
-
-    export PATH=${
-      pkgs.lib.makeBinPath [
-        pkgs.openssh
-        pkgs.openssl
-        pkgs.git
-      ]
-    }:$PATH
-
-    export CHAT_SERVER_HOST="''${CHAT_SERVER_HOST:-mugge-chat-server.norwayeast.azurecontainer.io}"
-    export CHAT_SERVER_PORT="''${CHAT_SERVER_PORT:-20222}"
-
-    exec ${clientBuild}/bin/mugge-client --assist-test "$@"
-  '';
 }
