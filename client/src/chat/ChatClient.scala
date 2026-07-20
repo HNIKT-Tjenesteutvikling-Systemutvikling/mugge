@@ -118,7 +118,9 @@ object ChatClient extends IOApp:
       muted: Boolean = false,
       voiceUsers: List[String] = Nil,
       assistSessions: Map[String, AssistSession] = Map.empty,
-      pendingAssist: List[(String, String)] = Nil
+      pendingAssist: List[(String, String)] = Nil,
+      isAdmin: Boolean = false,
+      adminMuted: Boolean = false
   )
 
   private case class Voice(handle: Audio.Handle, teardown: IO[Unit])
@@ -857,6 +859,10 @@ object ChatClient extends IOApp:
               halt.complete(Right(())).void
           else if msg.startsWith("CHALLENGE:") then
             handleAutoChallenge(msg.drop(10), state, outgoingQueue)
+          else if msg == "ADMIN" then state.update(_.copy(isAdmin = true))
+          else if msg.startsWith("MUTED:") then
+            val muted = msg.drop("MUTED:".length).trim == "1"
+            state.update(_.copy(adminMuted = muted))
           else if msg.startsWith("NICK:") then
             val newName = msg.drop("NICK:".length).trim
             state.update(_.copy(username = newName)) *>
@@ -1058,9 +1064,7 @@ object ChatClient extends IOApp:
     "!remind",
     "!reminders",
     "/acceptfile",
-    "/ban",
     "/help",
-    "/kick",
     "/mute",
     "/nick",
     "/quit",
@@ -1069,6 +1073,8 @@ object ChatClient extends IOApp:
     "/voice",
     "/voicetest"
   )
+
+  private val adminCommands = List("/ban", "/kick", "/unmute")
 
   private def splitLastToken(s: String): (String, String) =
     val i = s.lastIndexOf(' ')
@@ -1082,7 +1088,9 @@ object ChatClient extends IOApp:
   private def completionFor(inp: String, st: ClientState): IO[List[String]] =
     val (head, token) = splitLastToken(inp)
     if head.isEmpty && (token.startsWith("/") || token.startsWith("!")) then
-      IO.pure(clientCommands.filter(_.startsWith(token)))
+      val cmds =
+        if st.isAdmin then (clientCommands ++ adminCommands).sorted else clientCommands
+      IO.pure(cmds.filter(_.startsWith(token)))
     else if token.startsWith("@") then
       val p = token.drop(1).toLowerCase
       IO.pure(st.onlineUsers.filter(_.toLowerCase.startsWith(p)).sorted.map("@" + _))
@@ -1193,7 +1201,8 @@ object ChatClient extends IOApp:
       loopback: Boolean
   ): IO[Unit] =
     allow[Audio.AudioError] {
-      Audio.open(state.get.map(_.muted)).allocated.flatMap { case (handle, release) =>
+      val micMuted = state.get.map(st => st.muted || st.adminMuted)
+      Audio.open(micMuted).allocated.flatMap { case (handle, release) =>
         for
           seq <- Ref.of[IO, Int](0)
           captureFib <- handle.frames
@@ -1246,9 +1255,13 @@ object ChatClient extends IOApp:
     voiceRef.get.flatMap {
       case None => ui.printLine("You're not in voice. Join with /voice first.")
       case Some(_) =>
-        state
-          .updateAndGet(st => st.copy(muted = !st.muted))
-          .flatMap(st => ui.printLine(if st.muted then "Mic muted." else "Mic unmuted."))
+        state.get.flatMap { st =>
+          if st.adminMuted then ui.printLine("You are muted in voice by an admin.")
+          else
+            state
+              .updateAndGet(s => s.copy(muted = !s.muted))
+              .flatMap(s => ui.printLine(if s.muted then "Mic muted." else "Mic unmuted."))
+        }
     }
 
   private def startTyping(
