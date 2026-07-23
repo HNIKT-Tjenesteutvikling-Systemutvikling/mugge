@@ -128,7 +128,7 @@ object ChatClient extends IOApp:
   case class AssistSession(stdinQueue: Queue[IO, Chunk[Byte]], teardown: IO[Unit])
 
   private enum SessionOutcome:
-    case Quit, Incompatible, Lost, ConnectFailed
+    case Quit, Incompatible, Denied, Lost, ConnectFailed
 
   private val ansiReset = "\u001b[0m"
 
@@ -565,6 +565,8 @@ object ChatClient extends IOApp:
     else if line.startsWith("ASSISTEND:") then done.complete(ExitCode.Success).void
     else if line.startsWith("INCOMPATIBLE:") then
       Console[IO].errorln(line.drop("INCOMPATIBLE:".length)) *> done.complete(ExitCode.Error).void
+    else if line.startsWith("DENIED:") then
+      Console[IO].errorln(line.drop("DENIED:".length)) *> done.complete(ExitCode.Success).void
     else IO.unit
 
   private def startBridgePump(
@@ -597,6 +599,8 @@ object ChatClient extends IOApp:
     connectOnce.flatMap {
       case SessionOutcome.Quit         => IO.println("Bye!").as(ExitCode.Success)
       case SessionOutcome.Incompatible => IO.pure(ExitCode.Error)
+      // Refusal is terminal: exit clean so service mode does not respawn-loop.
+      case SessionOutcome.Denied => IO.pure(ExitCode.Success)
       case SessionOutcome.Lost =>
         if !serviceMode then
           IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
@@ -659,6 +663,7 @@ object ChatClient extends IOApp:
       IO.realTime.flatMap(t => Ref.of[IO, FiniteDuration](t)),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Boolean](false),
+      Ref.of[IO, Boolean](false),
       Ref.of[IO, String](""),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Int](0),
@@ -678,6 +683,7 @@ object ChatClient extends IOApp:
         lastWatchdogWall,
         connectionLost,
         incompatible,
+        denied,
         input,
         composing,
         blockLines,
@@ -712,6 +718,7 @@ object ChatClient extends IOApp:
           lastReceived,
           halt,
           incompatible,
+          denied,
           voiceRef
         )
           .onFinalize(logger.debug("Server reader stream finished."))
@@ -799,8 +806,9 @@ object ChatClient extends IOApp:
                 logger
                   .error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
             } >>
-          (connectionLost.get, incompatible.get).mapN { (lost, incompat) =>
-            if incompat then SessionOutcome.Incompatible
+          (connectionLost.get, incompatible.get, denied.get).mapN { (lost, incompat, refused) =>
+            if refused then SessionOutcome.Denied
+            else if incompat then SessionOutcome.Incompatible
             else if lost then SessionOutcome.Lost
             else SessionOutcome.Quit
           }
@@ -843,6 +851,7 @@ object ChatClient extends IOApp:
       lastReceived: Ref[IO, FiniteDuration],
       halt: Deferred[IO, Either[Throwable, Unit]],
       incompatible: Ref[IO, Boolean],
+      denied: Ref[IO, Boolean],
       voiceRef: Ref[IO, Option[Voice]]
   ): Stream[IO, Nothing] =
     socket.reads
@@ -856,6 +865,10 @@ object ChatClient extends IOApp:
           else if msg.startsWith("INCOMPATIBLE:") then
             incompatible.set(true) *>
               ui.printLine(msg.drop("INCOMPATIBLE:".length)) *>
+              halt.complete(Right(())).void
+          else if msg.startsWith("DENIED:") then
+            denied.set(true) *>
+              ui.printLine(msg.drop("DENIED:".length)) *>
               halt.complete(Right(())).void
           else if msg.startsWith("CHALLENGE:") then
             handleAutoChallenge(msg.drop(10), state, outgoingQueue)

@@ -48,8 +48,10 @@ runtime, so *no JDK or nix is required* on the target machine — any
   #+end_src
 - *Windows*: run the Linux build under [[https://learn.microsoft.com/windows/wsl/][WSL]].
   There is no native Windows binary.
-- *Auth*: a provisioned machine auto-authenticates via its SSH key +
-  git =user.name=; everyone else joins as a guest. Ed25519 keys work
-  out of the box; RSA OpenSSH keys need =ssh-keygen= (and =openssl= for
-  the PKCS#1 path) on =PATH=.
+- *Auth*: this is a team-only client. A provisioned machine
+  auto-authenticates via its SSH key + git =user.name=; any machine
+  that is not on the allowlist is refused at connect time and
+  disconnected — there is no guest access. Ed25519 keys work out of the
+  box; RSA OpenSSH keys need =ssh-keygen= (and =openssl= for the PKCS#1
+  path) on =PATH=.
 - *Voice* needs PipeWire/ALSA on the host; text chat works regardless.
