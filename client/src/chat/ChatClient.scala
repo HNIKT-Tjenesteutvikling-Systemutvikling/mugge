@@ -36,6 +36,13 @@ object ChatClient extends IOApp:
   private val defaultPort = port"20222"
   private val defaultHost = host"localhost"
 
+  private val pinMismatchNotice =
+    "Server key does not match the pinned key — possible MITM or key " +
+      "rotation; update the client."
+
+  private val insecureTlsNotice =
+    "⚠ --insecure-tls: the server certificate is NOT verified. Local dev only."
+
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
@@ -128,7 +135,7 @@ object ChatClient extends IOApp:
   case class AssistSession(stdinQueue: Queue[IO, Chunk[Byte]], teardown: IO[Unit])
 
   private enum SessionOutcome:
-    case Quit, Incompatible, Lost, ConnectFailed
+    case Quit, Incompatible, Denied, Lost, ConnectFailed
 
   private val ansiReset = "\u001b[0m"
 
@@ -416,21 +423,24 @@ object ChatClient extends IOApp:
       s"\u001b7$clears$header$entries\u001b8"
 
   def run(args: List[String]): IO[ExitCode] =
+    val insecureTls =
+      args.contains("--insecure-tls") || sys.env.get("MUGGE_INSECURE_TLS").contains("1")
     args.indexOf("--assist") match
       case idx if idx >= 0 =>
         args.lift(idx + 1) match
-          case Some(target) => runBridge(target)
+          case Some(target) => runBridge(target, insecureTls)
           case None =>
             Console[IO].errorln("Usage: mugge-client --assist <user>").as(ExitCode.Error)
-      case _ => runInteractive(args)
+      case _ => runInteractive(args, insecureTls)
 
-  private def runInteractive(args: List[String]): IO[ExitCode] =
-    val host = args.headOption
+  private def runInteractive(args: List[String], insecureTls: Boolean): IO[ExitCode] =
+    val positional = args.filterNot(_.startsWith("--"))
+    val host = positional.headOption
       .flatMap(Host.fromString)
       .orElse(sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString))
       .getOrElse(defaultHost)
 
-    val port = args
+    val port = positional
       .lift(1)
       .flatMap(Port.fromString)
       .orElse(sys.env.get("CHAT_SERVER_PORT").flatMap(Port.fromString))
@@ -450,38 +460,47 @@ object ChatClient extends IOApp:
         case Some(ghu) => logger.debug(s"Detected GitHub username: $ghu")
         case None      => logger.error("Could not detect GitHub username from git config")
 
-      tlsContext <- Network[IO].tlsContext.insecure
+      _ <- IO.whenA(insecureTls)(IO.println(insecureTlsNotice))
+      tlsContext <- if insecureTls then Network[IO].tlsContext.insecure else Tls.pinnedContext
       connectOnce = Network[IO]
         .connect(SocketAddress(host, port))
         .use { rawSocket =>
-          tlsContext.client(rawSocket).use { socket =>
-            for
-              _ <- IO.println(s"Connected to chat server at $host:$port")
-              state <- Ref.of[IO, ClientState](
-                ClientState(
-                  username = myUsername,
-                  githubUsername = githubUsername
+          tlsContext
+            .clientBuilder(rawSocket)
+            .withParameters(Tls.parameters)
+            .build
+            .use { socket =>
+              for
+                _ <- IO.println(s"Connected to chat server at $host:$port")
+                state <- Ref.of[IO, ClientState](
+                  ClientState(
+                    username = myUsername,
+                    githubUsername = githubUsername
+                  )
                 )
-              )
-              outcome <- handleConnection(socket, state)
-            yield outcome
-          }
+                outcome <- handleConnection(socket, state)
+              yield outcome
+            }
         }
-        .handleErrorWith {
-          case _: IOException =>
-            logger
-              .error(s"Failed to connect to server at $host:$port")
-              .as(SessionOutcome.ConnectFailed)
-          case err =>
-            logger.error(s"Error: ${err.getMessage}").as(SessionOutcome.ConnectFailed)
+        .handleErrorWith { err =>
+          if Tls.isPinMismatch(err) then IO.println(pinMismatchNotice).as(SessionOutcome.Denied)
+          else
+            err match
+              case _: IOException =>
+                logger
+                  .error(s"Failed to connect to server at $host:$port")
+                  .as(SessionOutcome.ConnectFailed)
+              case _ =>
+                logger.error(s"Error: ${err.getMessage}").as(SessionOutcome.ConnectFailed)
         }
       exitCode <- reconnectLoop(connectOnce, reconnectInitialBackoff)
     yield exitCode
 
-  private def runBridge(target: String): IO[ExitCode] =
+  private def runBridge(target: String, insecureTls: Boolean): IO[ExitCode] =
     val host = sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString).getOrElse(defaultHost)
     val port = sys.env.get("CHAT_SERVER_PORT").flatMap(Port.fromString).getOrElse(defaultPort)
     for
+      _ <- IO.whenA(insecureTls)(IO.println(insecureTlsNotice))
       githubUsername <- allow[Authentication.AuthError] {
         Authentication.detectGithubUsername()
       }.rescue(_ => IO.pure(None))
@@ -490,14 +509,22 @@ object ChatClient extends IOApp:
       }.rescue(_ => IO.pure(None))
       code <- (githubUsername, privateKey) match
         case (Some(gh), Some(key)) =>
-          Network[IO].tlsContext.insecure
+          (if insecureTls then Network[IO].tlsContext.insecure else Tls.pinnedContext)
             .flatMap { tls =>
               Network[IO]
                 .connect(SocketAddress(host, port))
-                .use(raw => tls.client(raw).use(socket => bridgeSession(socket, gh, key, target)))
+                .use(raw =>
+                  tls
+                    .clientBuilder(raw)
+                    .withParameters(Tls.parameters)
+                    .build
+                    .use(socket => bridgeSession(socket, gh, key, target))
+                )
             }
             .handleErrorWith { err =>
-              logger.error(s"Bridge connection failed: ${err.getMessage}").as(ExitCode.Error)
+              if Tls.isPinMismatch(err) then
+                Console[IO].errorln(pinMismatchNotice).as(ExitCode.Success)
+              else logger.error(s"Bridge connection failed: ${err.getMessage}").as(ExitCode.Error)
             }
         case _ =>
           logger
@@ -565,6 +592,8 @@ object ChatClient extends IOApp:
     else if line.startsWith("ASSISTEND:") then done.complete(ExitCode.Success).void
     else if line.startsWith("INCOMPATIBLE:") then
       Console[IO].errorln(line.drop("INCOMPATIBLE:".length)) *> done.complete(ExitCode.Error).void
+    else if line.startsWith("DENIED:") then
+      Console[IO].errorln(line.drop("DENIED:".length)) *> done.complete(ExitCode.Success).void
     else IO.unit
 
   private def startBridgePump(
@@ -597,6 +626,8 @@ object ChatClient extends IOApp:
     connectOnce.flatMap {
       case SessionOutcome.Quit         => IO.println("Bye!").as(ExitCode.Success)
       case SessionOutcome.Incompatible => IO.pure(ExitCode.Error)
+      // Refusal is terminal: exit clean so service mode does not respawn-loop.
+      case SessionOutcome.Denied => IO.pure(ExitCode.Success)
       case SessionOutcome.Lost =>
         if !serviceMode then
           IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)
@@ -659,6 +690,7 @@ object ChatClient extends IOApp:
       IO.realTime.flatMap(t => Ref.of[IO, FiniteDuration](t)),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Boolean](false),
+      Ref.of[IO, Boolean](false),
       Ref.of[IO, String](""),
       Ref.of[IO, Boolean](false),
       Ref.of[IO, Int](0),
@@ -678,6 +710,7 @@ object ChatClient extends IOApp:
         lastWatchdogWall,
         connectionLost,
         incompatible,
+        denied,
         input,
         composing,
         blockLines,
@@ -712,6 +745,7 @@ object ChatClient extends IOApp:
           lastReceived,
           halt,
           incompatible,
+          denied,
           voiceRef
         )
           .onFinalize(logger.debug("Server reader stream finished."))
@@ -795,12 +829,15 @@ object ChatClient extends IOApp:
                   .flatMap(_.traverse_(_.teardown))
             )
             .handleErrorWith { err =>
-              connectionLost.set(true) *>
-                logger
-                  .error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
+              if Tls.isPinMismatch(err) then denied.set(true) *> ui.printLine(pinMismatchNotice)
+              else
+                connectionLost.set(true) *>
+                  logger
+                    .error(s"\nConnection error: ${Option(err.getMessage).getOrElse(err.toString)}")
             } >>
-          (connectionLost.get, incompatible.get).mapN { (lost, incompat) =>
-            if incompat then SessionOutcome.Incompatible
+          (connectionLost.get, incompatible.get, denied.get).mapN { (lost, incompat, refused) =>
+            if refused then SessionOutcome.Denied
+            else if incompat then SessionOutcome.Incompatible
             else if lost then SessionOutcome.Lost
             else SessionOutcome.Quit
           }
@@ -843,6 +880,7 @@ object ChatClient extends IOApp:
       lastReceived: Ref[IO, FiniteDuration],
       halt: Deferred[IO, Either[Throwable, Unit]],
       incompatible: Ref[IO, Boolean],
+      denied: Ref[IO, Boolean],
       voiceRef: Ref[IO, Option[Voice]]
   ): Stream[IO, Nothing] =
     socket.reads
@@ -856,6 +894,10 @@ object ChatClient extends IOApp:
           else if msg.startsWith("INCOMPATIBLE:") then
             incompatible.set(true) *>
               ui.printLine(msg.drop("INCOMPATIBLE:".length)) *>
+              halt.complete(Right(())).void
+          else if msg.startsWith("DENIED:") then
+            denied.set(true) *>
+              ui.printLine(msg.drop("DENIED:".length)) *>
               halt.complete(Right(())).void
           else if msg.startsWith("CHALLENGE:") then
             handleAutoChallenge(msg.drop(10), state, outgoingQueue)
