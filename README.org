@@ -54,4 +54,10 @@ runtime, so *no JDK or nix is required* on the target machine — any
   disconnected — there is no guest access. Ed25519 keys work out of the
   box; RSA OpenSSH keys need =ssh-keygen= (and =openssl= for the PKCS#1
   path) on =PATH=.
+- *TLS*: the client speaks TLS 1.3 only and *pins* the server's public
+  key (hardcoded in =client/src/chat/Tls.scala=), so a MITM presenting a
+  different cert is refused with a clear error. Against a local dev
+  server that has no persistent key, pass =--insecure-tls= (or set
+  =MUGGE_INSECURE_TLS=1=) to skip pinning — it prints a warning and must
+  not be used in production.
 - *Voice* needs PipeWire/ALSA on the host; text chat works regardless.
