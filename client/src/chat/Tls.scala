@@ -19,7 +19,7 @@ object Tls:
   // server's MUGGE_TLS_KEY; backup is the offline spare kept for rotation.
   // Mint/rotate with `nix develop -c mintTlsKey <name>` in mugge-server.
   private val pins: Set[String] = Set(
-    "ddH9tVk8fuIHLAkKZo/rQez35V24SrQ2pe1Bd4jhvq0=",
+    "tVLA+aVAEJOZ0T7/5mkp3JbXN1ZftouoYRESdpriYwU=",
     "xabpD6pP6GsRQ8kaM4D+2aDZVbWSTq7V4G5kwlZnRzs="
   )
 
