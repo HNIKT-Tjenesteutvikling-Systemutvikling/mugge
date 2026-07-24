@@ -46,7 +46,7 @@ object ChatClient extends IOApp:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  private val protocolVersion = 6
+  private val protocolVersion = 7
 
   private val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 
@@ -123,6 +123,7 @@ object ChatClient extends IOApp:
       colors: Map[String, Int] = Map.empty,
       onlineUsers: List[String] = Nil,
       typingUsers: List[String] = Nil,
+      statuses: Map[String, String] = Map.empty,
       outgoingFiles: Map[String, OutgoingFile] = Map.empty,
       incomingFiles: Map[String, IncomingFile] = Map.empty,
       pingHistory: Map[String, List[FiniteDuration]] = Map.empty,
@@ -208,7 +209,11 @@ object ChatClient extends IOApp:
           (st.copy(colors = st.colors + (name -> idx)), idx)
     }
 
-  private def colorizeForDisplay(msg: String, state: Ref[IO, ClientState]): IO[String] =
+  private def colorizeForDisplay(
+      msg: String,
+      state: Ref[IO, ClientState],
+      withStatus: Boolean = true
+  ): IO[String] =
     msg match
       case displayPattern(time, indicator, sender, content) =>
         if sender.trim == "SERVER" then
@@ -216,10 +221,15 @@ object ChatClient extends IOApp:
             s"[$time] $indicator $serverColor$sender$ansiReset: $serverColor$content$ansiReset"
           )
         else
-          colorIndexFor(sender.trim, state).map { idx =>
+          (colorIndexFor(sender.trim, state), state.get).flatMapN { (idx, st) =>
             val bright = ansiPalette(idx)
             val dim = ansiDimPalette(idx)
-            s"[$time] $indicator $bright$sender$ansiReset: $dim$content$ansiReset"
+            val status =
+              if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
+            val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
+            IO.pure(
+              s"[$time] $indicator $bright$sender$ansiReset$statusPart: $dim$content$ansiReset"
+            )
           }
       case _ => IO.pure(msg)
 
@@ -313,8 +323,13 @@ object ChatClient extends IOApp:
       }
 
     def setUsers(users: List[String]): IO[Unit] =
-      state.modify(st => (st.copy(onlineUsers = users), st.onlineUsers != users)).flatMap {
-        changed =>
+      state
+        .modify { st =>
+          val pruned = st.statuses.filter((name, _) => users.contains(name))
+          val changed = st.onlineUsers != users || st.statuses != pruned
+          (st.copy(onlineUsers = users, statuses = pruned), changed)
+        }
+        .flatMap { changed =>
           if !changed then IO.unit
           else
             mutex.lock.surround {
@@ -324,7 +339,24 @@ object ChatClient extends IOApp:
                 case Some((cols, rows)) => render(None, cols, rows)
               }
             }
-      }
+        }
+
+    def setStatuses(name: String, status: Option[String]): IO[Unit] =
+      state
+        .modify { st =>
+          val updated = status.fold(st.statuses - name)(s => st.statuses + (name -> s))
+          (st.copy(statuses = updated), st.statuses != updated)
+        }
+        .flatMap { changed =>
+          if !changed then IO.unit
+          else
+            mutex.lock.surround {
+              termSize.get.flatMap {
+                case None               => IO.unit
+                case Some((cols, rows)) => render(None, cols, rows)
+              }
+            }
+        }
 
     def setVoiceUsers(users: List[String]): IO[Unit] =
       state.modify(st => (st.copy(voiceUsers = users), st.voiceUsers != users)).flatMap { changed =>
@@ -382,7 +414,11 @@ object ChatClient extends IOApp:
         textWidth = math.max(1, startCol - 1)
         clearRows = math.min(rows - 1, 30)
         visible = st.onlineUsers.take(math.max(0, clearRows - 1))
-        colored <- visible.traverse(u => colorIndexFor(u, state).map(idx => (u, ansiPalette(idx))))
+        colored <- visible.traverse(u =>
+          colorIndexFor(u, state).map(idx =>
+            (u, ansiPalette(idx), ansiDimPalette(idx), st.statuses.get(u).filter(_.nonEmpty))
+          )
+        )
         (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
         sb = new StringBuilder
         _ = sb.append("\u001b[2J\u001b[H")
@@ -406,7 +442,11 @@ object ChatClient extends IOApp:
         textWidth = math.max(1, startCol - 1)
         clearRows = math.min(rows - 1, 30)
         visible = st.onlineUsers.take(math.max(0, clearRows - 1))
-        colored <- visible.traverse(u => colorIndexFor(u, state).map(idx => (u, ansiPalette(idx))))
+        colored <- visible.traverse(u =>
+          colorIndexFor(u, state).map(idx =>
+            (u, ansiPalette(idx), ansiDimPalette(idx), st.statuses.get(u).filter(_.nonEmpty))
+          )
+        )
         (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
         sb = new StringBuilder
         _ = sb.append(eraseBlock(prev))
@@ -445,7 +485,7 @@ object ChatClient extends IOApp:
       (all.map(r => s"\r\u001b[2K$r").mkString("\n"), all.size)
 
     private def panelStr(
-        colored: List[(String, String)],
+        colored: List[(String, String, String, Option[String])],
         voice: Set[String],
         total: Int,
         startCol: Int,
@@ -454,12 +494,26 @@ object ChatClient extends IOApp:
       val clears =
         (1 to clearRows).map(r => s"\u001b[$r;${startCol}H" + " " * panelWidth).mkString
       val header = s"\u001b[1;${startCol}H\u001b[1m\u2524 Online ($total)\u001b[0m"
-      val entries = colored.zipWithIndex.map { case ((u, color), i) =>
+      val entries = colored.zipWithIndex.map { case ((u, color, dim, status), i) =>
         val bullet = if voice.contains(u) then "\u266a" else "\u2022"
-        val name = if u.length > panelWidth - 2 then u.take(panelWidth - 2) else u
-        s"\u001b[${2 + i};${startCol}H$color$bullet $name$ansiReset"
+        s"\u001b[${2 + i};${startCol}H$color$bullet ${panelLabel(u, status, color, dim)}"
       }.mkString
       s"\u001b7$clears$header$entries\u001b8"
+
+    private def panelLabel(
+        name: String,
+        status: Option[String],
+        bright: String,
+        dim: String
+    ): String =
+      val avail = math.max(1, panelWidth - 2)
+      status match
+        case Some(s) if name.length <= avail - 4 =>
+          val room = avail - name.length - 3
+          val shown = if s.length > room then s.take(room - 1) + "\u2026" else s
+          s"$bright$name$ansiReset$dim ($shown)$ansiReset"
+        case _ =>
+          s"$bright${if name.length > avail then name.take(avail) else name}$ansiReset"
 
   def run(args: List[String]): IO[ExitCode] =
     val insecureTls =
@@ -958,9 +1012,16 @@ object ChatClient extends IOApp:
             state.update(_.copy(username = newName)) *>
               ui.printLine(s"${serverColor}You are now known as $newName$ansiReset")
           // Replayed history renders like chat but must not re-fire
-          // mention/ping notifications.
+          // mention/ping notifications, and must not carry today's statuses.
           else if msg.startsWith("HIST:") then
-            colorizeForDisplay(msg.drop("HIST:".length), state).flatMap(ui.printLine)
+            colorizeForDisplay(msg.drop("HIST:".length), state, withStatus = false)
+              .flatMap(ui.printLine)
+          else if msg.startsWith("STATUS:") then
+            msg.split(":", 3) match
+              case Array(_, name, text) =>
+                val trimmed = text.trim
+                ui.setStatuses(name.trim, if trimmed.isEmpty then None else Some(trimmed))
+              case _ => IO.unit
           else if msg.startsWith("USERS:") then
             val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
             ui.setUsers(users)
