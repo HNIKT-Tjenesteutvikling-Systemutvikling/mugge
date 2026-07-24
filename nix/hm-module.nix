@@ -23,7 +23,7 @@ let
     fi
     echo "Attaching to mugge chat. Detach with Ctrl-\\ (the connection stays up)."
     echo "To stop the background service entirely: systemctl --user stop mugge-chat"
-    exec ${pkgs.dtach}/bin/dtach -a "$sock" -e '^\'
+    exec ${pkgs.dtach}/bin/dtach -a "$sock" -e '^\' -r ctrl_l
   '';
 in
 {

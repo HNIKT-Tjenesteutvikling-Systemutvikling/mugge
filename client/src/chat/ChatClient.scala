@@ -64,6 +64,11 @@ object ChatClient extends IOApp:
   private val maxPasteChars = 8 * 1024
   private val pasteLineDelay = 400.milliseconds
 
+  // dtach keeps no scrollback, so the client keeps its own to repaint on attach.
+  private val scrollbackSize = 200
+
+  private val resizePollInterval = 300.milliseconds
+
   private val pingInterval = 60.seconds
   private val watchdogInterval = 30.seconds
   private val deadAfter = 3.minutes
@@ -286,19 +291,25 @@ object ChatClient extends IOApp:
       ictl: InputCtl,
       blockLines: Ref[IO, Int],
       pty: Boolean,
-      termSize: Ref[IO, Option[(Int, Int)]]
+      termSize: Ref[IO, Option[(Int, Int)]],
+      scrollback: Ref[IO, Vector[String]]
   ):
     def isTty: Boolean = pty
 
     private def plainPrint(line: String): IO[Unit] =
       if pty then Console[IO].print(line + "\r\n") else Console[IO].println(line)
 
+    // Stored pre-wrap so a redraw re-wraps at the current width.
+    private def appendScrollback(line: String): IO[Unit] =
+      scrollback.update(v => (v :+ line).takeRight(scrollbackSize))
+
     def printLine(line: String): IO[Unit] =
       mutex.lock.surround {
-        termSize.get.flatMap {
-          case None               => plainPrint(line)
-          case Some((cols, rows)) => render(Some(line), cols, rows)
-        }
+        appendScrollback(line) *>
+          termSize.get.flatMap {
+            case None               => plainPrint(line)
+            case Some((cols, rows)) => render(Some(line), cols, rows)
+          }
       }
 
     def setUsers(users: List[String]): IO[Unit] =
@@ -348,13 +359,41 @@ object ChatClient extends IOApp:
         }
       }
 
-    def onResize: IO[Unit] =
-      mutex.lock.surround {
-        termSize.get.flatMap {
-          case None               => IO.unit
-          case Some((cols, rows)) => blockLines.set(0) *> render(None, cols, rows)
+    // Re-detect the size first so it repaints straight out of the headless
+    // (None) state on the first attach, before the watcher poll lands.
+    def redraw: IO[Unit] =
+      detectTerminal.flatMap { latest =>
+        mutex.lock.surround {
+          termSize.set(latest) *> (latest match
+            case None               => IO.unit
+            case Some((cols, rows)) => fullRepaint(cols, rows)
+          )
         }
       }
+
+    private def fullRepaint(cols: Int, rows: Int): IO[Unit] =
+      for
+        st <- state.get
+        inp <- ictl.text.get
+        paste <- ictl.pendingPaste.get
+        hint <- ictl.hint.get
+        ring <- scrollback.get
+        startCol = math.max(1, cols - panelWidth + 1)
+        textWidth = math.max(1, startCol - 1)
+        clearRows = math.min(rows - 1, 30)
+        visible = st.onlineUsers.take(math.max(0, clearRows - 1))
+        colored <- visible.traverse(u => colorIndexFor(u, state).map(idx => (u, ansiPalette(idx))))
+        (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
+        sb = new StringBuilder
+        _ = sb.append("\u001b[2J\u001b[H")
+        _ = ring.foreach(l => wrapAnsi(l, textWidth).foreach(r => sb.append(r).append("\n")))
+        _ = sb.append(blockStr)
+        _ = sb.append(
+          panelStr(colored, st.voiceUsers.toSet, st.onlineUsers.size, startCol, clearRows)
+        )
+        _ <- Console[IO].print(sb.toString)
+        _ <- blockLines.set(newCount)
+      yield ()
 
     private def render(chat: Option[String], cols: Int, rows: Int): IO[Unit] =
       for
@@ -698,7 +737,8 @@ object ChatClient extends IOApp:
       Ref.of[IO, Option[Voice]](None),
       Ref.of[IO, Option[String]](None),
       Ref.of[IO, Option[String]](None),
-      Ref.of[IO, Option[(List[Char], Int)]](None)
+      Ref.of[IO, Option[(List[Char], Int)]](None),
+      Ref.of[IO, Vector[String]](Vector.empty)
     ).tupled.flatMap { tup =>
       val (
         initialSize,
@@ -718,10 +758,11 @@ object ChatClient extends IOApp:
         voiceRef,
         hint,
         pendingPaste,
-        pasteBuf
+        pasteBuf,
+        scrollback
       ) = tup
       val ictl = InputCtl(input, hint, pendingPaste, pasteBuf, composing)
-      val ui = new Ui(mutex, state, ictl, blockLines, pty, termSize)
+      val ui = new Ui(mutex, state, ictl, blockLines, pty, termSize, scrollback)
 
       val serverWriter: Stream[IO, Nothing] =
         (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
@@ -790,13 +831,20 @@ object ChatClient extends IOApp:
       val terminalWatcher: Stream[IO, Unit] =
         if !pty then Stream.empty.covary[IO]
         else
-          Stream.awakeEvery[IO](1.second).evalMap { _ =>
-            detectTerminal.flatMap { latest =>
-              termSize.getAndSet(latest).flatMap { previous =>
-                if previous == latest then IO.unit
-                else
-                  (if previous.isEmpty && latest.isDefined then Console[IO].print("\u001b[?2004h")
-                   else IO.unit) *> ui.onResize
+          Stream.eval(Ref.of[IO, Option[(Int, Int)]](None)).flatMap { lastPoll =>
+            Stream.awakeEvery[IO](resizePollInterval).evalMap { _ =>
+              detectTerminal.flatMap { latest =>
+                (lastPoll.getAndSet(latest), termSize.get).flatMapN { (prevPoll, committed) =>
+                  // Re-arm bracketed paste when the pty first appears.
+                  val rearm =
+                    if prevPoll.isEmpty && latest.isDefined then Console[IO].print("\u001b[?2004h")
+                    else IO.unit
+                  // Debounce: repaint once two consecutive polls agree, so a
+                  // drag-resize redraws once at the final size.
+                  val apply =
+                    if latest == prevPoll && latest != committed then ui.redraw else IO.unit
+                  rearm *> apply
+                }
               }
             }
           }
@@ -1095,6 +1143,8 @@ object ChatClient extends IOApp:
           }
       case '\u0004' => // Ctrl-D on an empty prompt behaves like /quit
         if serviceMode then ui.printLine(quitHint) else halt.complete(Right(())).void
+      case '\u000c' => // Ctrl-L (and dtach's ctrl_l attach hook) repaints
+        ui.redraw
       case c if c >= ' ' =>
         ictl.hint.set(None) *>
           ictl.text.update(_ + c) *>
