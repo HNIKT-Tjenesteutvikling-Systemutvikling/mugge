@@ -28,6 +28,7 @@ import java.security.*
 import java.util.Base64
 import scala.concurrent.duration.*
 import scala.sys.process.*
+import scala.util.matching.Regex
 
 object ChatClient extends IOApp:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]
@@ -180,25 +181,68 @@ object ChatClient extends IOApp:
 
   private val serverColor = "\u001b[38;5;245m"
 
+  private val osc8Prefix = "\u001b]8;;"
+  private val osc8Close = s"$osc8Prefix\u001b\\"
+
   private def ansiSeqLength(s: String, start: Int): Int =
     if start + 1 >= s.length then 1
     else if s.charAt(start + 1) == '[' then
       val finalByte = s.indexWhere(c => c >= '@' && c <= '~', start + 2)
       if finalByte < 0 then s.length - start else finalByte - start + 1
+    else if s.charAt(start + 1) == ']' then oscSeqLength(s, start)
     else 2
+
+  // OSC runs to a BEL or an ST (ESC \), unlike the CSI final-byte rule above.
+  private def oscSeqLength(s: String, start: Int): Int =
+    @annotation.tailrec
+    def loop(i: Int): Int =
+      if i >= s.length then s.length - start
+      else if s.charAt(i) == '\u0007' then i - start + 1
+      else if s.charAt(i) == '\u001b' && i + 1 < s.length && s.charAt(i + 1) == '\\' then
+        i - start + 2
+      else loop(i + 1)
+    loop(start + 2)
+
+  private def isOsc8Open(s: String, start: Int, end: Int): Boolean =
+    s.startsWith(osc8Prefix, start) && end - start > osc8Close.length
+
+  // Visible cells of a hyperlink label: the text runs up to its closing escape.
+  private def linkCells(s: String, from: Int): Int =
+    @annotation.tailrec
+    def loop(i: Int, cells: Int): Int =
+      if i >= s.length || s.charAt(i) == '\u001b' then cells
+      else loop(i + Character.charCount(s.codePointAt(i)), cells + 1)
+    loop(from, 0)
 
   private def wrapAnsi(s: String, width: Int): List[String] =
     @annotation.tailrec
     def loop(i: Int, cells: Int, row: String, acc: List[String]): List[String] =
       if i >= s.length then acc :+ row
       else if s.charAt(i) == '\u001b' then
-        val len = ansiSeqLength(s, i)
-        loop(i + len, cells, row + s.substring(i, i + len), acc)
+        val next = i + ansiSeqLength(s, i)
+        val link = if isOsc8Open(s, i, next) then linkCells(s, next) else 0
+        // Push a whole URL to the next row rather than splitting it.
+        if cells > 0 && link > 0 && link <= width && cells + link > width then
+          loop(i, 0, "", acc :+ row)
+        else loop(next, cells, row + s.substring(i, next), acc)
       else if cells == width then loop(i, 0, "", acc :+ row)
       else
         val n = Character.charCount(s.codePointAt(i))
         loop(i + n, cells + 1, row + s.substring(i, i + n), acc)
     loop(0, 0, "", Nil)
+
+  private val urlPattern: Regex = """https?://[^\s"'<>)\]]+""".r
+
+  private def linkify(s: String): String =
+    if s.indexOf("http") < 0 then s
+    else
+      urlPattern.replaceAllIn(
+        s,
+        m =>
+          Regex.quoteReplacement(
+            s"$osc8Prefix${m.matched}\u001b\\${m.matched}$osc8Close"
+          )
+      )
 
   private val displayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
@@ -252,7 +296,8 @@ object ChatClient extends IOApp:
       case displayPattern(time, indicator, sender, content) =>
         if sender.trim == "SERVER" then
           IO.pure(
-            s"[$time] $indicator $serverColor$sender$ansiReset: $serverColor$content$ansiReset"
+            s"[$time] $indicator $serverColor$sender$ansiReset: " +
+              s"$serverColor${linkify(content)}$ansiReset"
           )
         else
           (colorIndexFor(sender.trim, state), state.get).flatMapN { (idx, st) =>
@@ -262,7 +307,8 @@ object ChatClient extends IOApp:
               if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
             val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
             IO.pure(
-              s"[$time] $indicator $bright$sender$ansiReset$statusPart: $dim$content$ansiReset"
+              s"[$time] $indicator $bright$sender$ansiReset$statusPart: " +
+                s"$dim${linkify(content)}$ansiReset"
             )
           }
       case _ => IO.pure(msg)
