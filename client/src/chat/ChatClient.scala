@@ -67,6 +67,9 @@ object ChatClient extends IOApp:
   // dtach keeps no scrollback, so the client keeps its own to repaint on attach.
   private val scrollbackSize = 200
 
+  private val historySize = 200
+  private val maxHistoryEntryChars = 4 * 1024
+
   private val resizePollInterval = 300.milliseconds
 
   private val pingInterval = 60.seconds
@@ -292,10 +295,10 @@ object ChatClient extends IOApp:
 
   private enum InputToken:
     case Ch(c: Char)
-    case PasteStart, PasteEnd, Newline
+    case PasteStart, PasteEnd, Newline, HistoryPrev, HistoryNext
 
   private enum EscState:
-    case Ground, Esc
+    case Ground, Esc, Ss3
     case Csi(params: String)
 
   // Kitty keyboard protocol: a modified Enter (e.g. Shift+Enter -> ESC[13;2u)
@@ -316,26 +319,67 @@ object ChatClient extends IOApp:
             else (EscState.Ground, List(InputToken.Ch(c)))
           case EscState.Esc =>
             if c == '[' then (EscState.Csi(""), Nil)
+            // SS3: in application-cursor-key mode an arrow arrives as ESC O A.
+            else if c == 'O' then (EscState.Ss3, Nil)
             else if c == '\r' || c == '\n' then (EscState.Ground, List(InputToken.Newline))
             else (EscState.Ground, Nil)
+          case EscState.Ss3 =>
+            c match
+              case 'A' => (EscState.Ground, List(InputToken.HistoryPrev))
+              case 'B' => (EscState.Ground, List(InputToken.HistoryNext))
+              case _   => (EscState.Ground, Nil)
           case EscState.Csi(params) =>
             if c >= '@' && c <= '~' then
               val tok = (params, c) match
                 case ("200", '~') => List(InputToken.PasteStart)
                 case ("201", '~') => List(InputToken.PasteEnd)
                 case (p, 'u')     => csiUToken(p)
+                case (_, 'A')     => List(InputToken.HistoryPrev)
+                case (_, 'B')     => List(InputToken.HistoryNext)
                 case _            => Nil
               (EscState.Ground, tok)
             else (EscState.Csi(params + c), Nil)
       }
       .flatMap((_, toks) => Stream.emits(toks))
 
+  // `pos` is None while the live draft is on the prompt, Some(i) while browsing;
+  // `draft` holds the text browsing started from, restored on stepping past the end.
+  final case class InputHistory(entries: Vector[String], pos: Option[Int], draft: String)
+
+  object InputHistory:
+    val empty: InputHistory = InputHistory(Vector.empty, None, "")
+
+  private def recordHistory(h: InputHistory, line: String): InputHistory =
+    val keep =
+      line.trim.nonEmpty &&
+        line.length <= maxHistoryEntryChars &&
+        !h.entries.lastOption.contains(line)
+    if keep then InputHistory((h.entries :+ line).takeRight(historySize), None, "")
+    else h.copy(pos = None, draft = "")
+
+  private def historyPrev(h: InputHistory, current: String): (InputHistory, Option[String]) =
+    h.pos match
+      case _ if h.entries.isEmpty => (h, None)
+      case None =>
+        val i = h.entries.size - 1
+        (h.copy(pos = Some(i), draft = current), Some(h.entries(i)))
+      case Some(0) => (h, None)
+      case Some(i) => (h.copy(pos = Some(i - 1)), Some(h.entries(i - 1)))
+
+  private def historyNext(h: InputHistory): (InputHistory, Option[String]) =
+    h.pos match
+      case None => (h, None)
+      case Some(i) if i >= h.entries.size - 1 =>
+        (h.copy(pos = None, draft = ""), Some(h.draft))
+      case Some(i) => (h.copy(pos = Some(i + 1)), Some(h.entries(i + 1)))
+
   final case class InputCtl(
       text: Ref[IO, String],
       hint: Ref[IO, Option[String]],
       pendingPaste: Ref[IO, Option[PendingPaste]],
       paste: Ref[IO, Option[(List[Char], Int)]],
-      composing: Ref[IO, Boolean]
+      composing: Ref[IO, Boolean],
+      history: Ref[IO, InputHistory]
   )
 
   final class Ui(
@@ -674,6 +718,8 @@ object ChatClient extends IOApp:
 
       _ <- IO.whenA(insecureTls)(IO.println(insecureTlsNotice))
       tlsContext <- if insecureTls then Network[IO].tlsContext.insecure else Tls.pinnedContext
+      // Outlives a session so input history survives the reconnect loop.
+      inputHistory <- Ref.of[IO, InputHistory](InputHistory.empty)
       connectOnce = Network[IO]
         .connect(SocketAddress(host, port))
         .use { rawSocket =>
@@ -690,7 +736,7 @@ object ChatClient extends IOApp:
                     githubUsername = githubUsername
                   )
                 )
-                outcome <- handleConnection(socket, state)
+                outcome <- handleConnection(socket, state, inputHistory)
               yield outcome
             }
         }
@@ -867,7 +913,8 @@ object ChatClient extends IOApp:
 
   private def handleConnection(
       socket: Socket[IO],
-      state: Ref[IO, ClientState]
+      state: Ref[IO, ClientState],
+      inputHistory: Ref[IO, InputHistory]
   ): IO[SessionOutcome] = {
     val initialDataIO: IO[String] = for {
       hostname <- getHostname
@@ -934,7 +981,7 @@ object ChatClient extends IOApp:
         pasteBuf,
         scrollback
       ) = tup
-      val ictl = InputCtl(input, hint, pendingPaste, pasteBuf, composing)
+      val ictl = InputCtl(input, hint, pendingPaste, pasteBuf, composing, inputHistory)
       val ui = new Ui(mutex, state, ictl, blockLines, pty, termSize, scrollback)
 
       val serverWriter: Stream[IO, Nothing] =
@@ -1304,6 +1351,16 @@ object ChatClient extends IOApp:
     tok match
       case InputToken.PasteStart => ictl.paste.set(Some((Nil, 0)))
       case InputToken.PasteEnd   => finishPaste(outgoingQueue, ui, ictl)
+      case InputToken.HistoryPrev =>
+        ictl.paste.get.flatMap {
+          case Some(_) => IO.unit
+          case None    => recallHistory(back = true, ui, ictl)
+        }
+      case InputToken.HistoryNext =>
+        ictl.paste.get.flatMap {
+          case Some(_) => IO.unit
+          case None    => recallHistory(back = false, ui, ictl)
+        }
       case InputToken.Newline =>
         ictl.paste.get.flatMap {
           case Some(_) => IO.unit
@@ -1320,6 +1377,21 @@ object ChatClient extends IOApp:
             else IO.unit
           case None => handleInputChar(c, outgoingQueue, halt, state, ui, ictl, voiceRef)
         }
+
+  private def recallHistory(back: Boolean, ui: Ui, ictl: InputCtl): IO[Unit] =
+    ictl.pendingPaste.get.flatMap {
+      case Some(_) => IO.unit
+      case None =>
+        ictl.text.get
+          .flatMap(cur =>
+            ictl.history.modify(h => if back then historyPrev(h, cur) else historyNext(h))
+          )
+          .flatMap {
+            case None => IO.unit
+            case Some(line) =>
+              ictl.hint.set(None) *> ictl.text.set(line) *> ui.refreshInput
+          }
+    }
 
   private def insertInputNewline(
       outgoingQueue: Queue[IO, String],
@@ -1390,7 +1462,8 @@ object ChatClient extends IOApp:
       case '\n' | '\r' =>
         (ictl.text.getAndSet(""), ictl.pendingPaste.getAndSet(None), ictl.hint.getAndSet(None))
           .flatMapN { (line, paste, _) =>
-            ui.refreshInput *>
+            ictl.history.update(recordHistory(_, line.stripSuffix("\n"))) *>
+              ui.refreshInput *>
               stopTyping(outgoingQueue, ictl.composing) *>
               submitInput(line, outgoingQueue, halt, state, ui, voiceRef) *>
               paste.traverse_(sendPasteBlock(_, outgoingQueue))
@@ -1412,6 +1485,8 @@ object ChatClient extends IOApp:
                     (if s.isEmpty then stopTyping(outgoingQueue, ictl.composing) else IO.unit)
                 }
           }
+      case '\u0010' => recallHistory(back = true, ui, ictl)
+      case '\u000e' => recallHistory(back = false, ui, ictl)
       case '\u0004' => // Ctrl-D on an empty prompt behaves like /quit
         if serviceMode then ui.printLine(quitHint) else halt.complete(Right(())).void
       case '\u000c' => // Ctrl-L (and dtach's ctrl_l attach hook) repaints
