@@ -97,6 +97,8 @@ rec {
         pkgs.libnotify
         pkgs.pipewire
         pkgs.util-linux
+        pkgs.swayidle
+        pkgs.glib.bin
       ]
     }:$PATH
 

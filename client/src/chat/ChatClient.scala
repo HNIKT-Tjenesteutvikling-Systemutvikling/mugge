@@ -79,6 +79,9 @@ object ChatClient extends IOApp:
 
   private val typingRefreshInterval = 3.seconds
 
+  private val awayAfter = 10.minutes
+  private val awayStatus = "away"
+
   private val suspendGraceThreshold = 30.seconds
 
   private val reconnectInitialBackoff = 2.seconds
@@ -1073,6 +1076,11 @@ object ChatClient extends IOApp:
           }
         }
 
+      val awayWatcher: Stream[IO, Unit] =
+        Stream.eval(Ref.of[IO, AwayHold](None)).flatMap { held =>
+          Idle.transitions(awayAfter).evalMap(idle => applyAway(idle, held, state, outgoingQueue))
+        }
+
       val watchdog: Stream[IO, Unit] =
         Stream.awakeEvery[IO](watchdogInterval).evalMap { _ =>
           for
@@ -1123,7 +1131,8 @@ object ChatClient extends IOApp:
           pinger,
           watchdog,
           typingRefresher,
-          terminalWatcher
+          terminalWatcher,
+          awayWatcher
         )
 
       rawMode(pty).use { _ =>
@@ -1747,6 +1756,27 @@ object ChatClient extends IOApp:
               .updateAndGet(s => s.copy(muted = !s.muted))
               .flatMap(s => ui.printLine(if s.muted then "Mic muted." else "Mic unmuted."))
         }
+    }
+
+  // Some(previous) exactly while the away override is ours to undo, so a status
+  // the user set by hand is never overwritten or restored on their behalf.
+  private type AwayHold = Option[Option[String]]
+
+  private def applyAway(
+      idle: Boolean,
+      held: Ref[IO, AwayHold],
+      state: Ref[IO, ClientState],
+      outgoingQueue: Queue[IO, String]
+  ): IO[Unit] =
+    (state.get, held.get).flatMapN { (st, hold) =>
+      (hold, idle) match
+        case (None, true) if !st.inVoice =>
+          held.set(Some(st.statuses.get(st.username))) *>
+            outgoingQueue.offer(s"/status $awayStatus")
+        case (Some(previous), false) =>
+          held.set(None) *>
+            outgoingQueue.offer(previous.fold("/status")(text => s"/status $text"))
+        case _ => IO.unit
     }
 
   private def startTyping(
