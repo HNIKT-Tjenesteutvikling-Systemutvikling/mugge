@@ -4,7 +4,9 @@ import cats.effect.*
 import cats.effect.std.Queue
 import cats.mtl.Raise
 import cats.syntax.all.*
+import fs2.Chunk
 import fs2.Stream
+import fs2.io.process.ProcessBuilder
 
 import java.io.ByteArrayInputStream
 import java.util.Base64
@@ -37,29 +39,26 @@ object Audio:
   final class Handle(
       senders: Ref[IO, Map[String, Queue[IO, Array[Short]]]],
       hangover: Ref[IO, Int],
-      capture: TargetDataLine,
-      playbackLine: SourceDataLine,
-      checkMuted: IO[Boolean]
+      rawFrames: Stream[IO, Array[Byte]],
+      writeFrame: Array[Byte] => IO[Unit],
+      checkMuted: IO[Boolean],
+      val backend: String
   ):
     val frames: Stream[IO, String] =
-      Stream
-        .repeatEval(IO.blocking(readFrame(capture)))
-        .unNoneTerminate
-        .evalMap { buf =>
-          checkMuted.flatMap { muted =>
-            if muted then hangover.set(0).as(None)
-            else
-              val loud = rms(buf) >= voxRmsThreshold
-              hangover
-                .modify { h =>
-                  if loud then (hangoverFrames, true)
-                  else if h > 0 then (h - 1, true)
-                  else (0, false)
-                }
-                .map(send => Option.when(send)(Base64.getEncoder.encodeToString(buf)))
-          }
+      rawFrames.evalMap { buf =>
+        checkMuted.flatMap { muted =>
+          if muted then hangover.set(0).as(None)
+          else
+            val loud = rms(buf) >= voxRmsThreshold
+            hangover
+              .modify { h =>
+                if loud then (hangoverFrames, true)
+                else if h > 0 then (h - 1, true)
+                else (0, false)
+              }
+              .map(send => Option.when(send)(Base64.getEncoder.encodeToString(buf)))
         }
-        .unNone
+      }.unNone
 
     def receive(from: String, b64: String): IO[Unit] =
       IO(decodeFrame(b64)).flatMap { frame =>
@@ -80,9 +79,7 @@ object Audio:
           .map(_.flatten)
           .flatMap { taken =>
             if taken.isEmpty then IO.unit
-            else
-              val mixed = mix(taken)
-              IO.blocking(playbackLine.write(mixed, 0, mixed.length)).void
+            else writeFrame(mix(taken))
           }
       }
 
@@ -159,7 +156,50 @@ object Audio:
       (0 until channels).iterator.flatMap(_ => Iterator(lo, hi))
     }.toArray
 
-  def open(checkMuted: IO[Boolean])(using Raise[IO, AudioError]): Resource[IO, Handle] =
+  private final case class Io(
+      frames: Stream[IO, Array[Byte]],
+      write: Array[Byte] => IO[Unit],
+      name: String
+  )
+
+  private val pipewireArgs = List(
+    "--format",
+    "s16",
+    "--rate",
+    sampleRate.toInt.toString,
+    "--channels",
+    "1",
+    "--raw",
+    "--latency",
+    "40ms",
+    "-"
+  )
+
+  // JavaSound cannot do full duplex through PipeWire's ALSA device: once the
+  // capture line is open the playback line stays silent. The PipeWire tools
+  // handle both directions and follow the desktop's default source and sink.
+  private def pipewireIo: Resource[IO, Io] =
+    for
+      recorder <- ProcessBuilder("pw-record", pipewireArgs).spawn[IO]
+      player <- ProcessBuilder("pw-play", pipewireArgs).spawn[IO]
+      outgoing <- Resource.eval(Queue.circularBuffer[IO, Chunk[Byte]](jitterCapacity))
+      _ <- Stream
+        .fromQueueUnterminated(outgoing)
+        .flatMap(Stream.chunk)
+        .through(player.stdin)
+        .compile
+        .drain
+        .background
+      // fs2 always pipes stderr; left undrained, the tools would eventually
+      // block on a full pipe.
+      _ <- recorder.stderr.merge(player.stderr).compile.drain.background
+    yield Io(
+      recorder.stdout.chunkN(frameBytes, allowFewer = false).map(_.toArray),
+      bytes => outgoing.offer(Chunk.array(bytes)),
+      "pipewire"
+    )
+
+  private def javaSoundIo(using Raise[IO, AudioError]): Resource[IO, Io] =
     for
       capture <- Resource.make(orRaise(IO.blocking {
         val line = AudioSystem.getTargetDataLine(format)
@@ -173,9 +213,18 @@ object Audio:
         line.start()
         line
       }))(l => IO.blocking { l.flush(); l.stop(); l.close() })
+    yield Io(
+      Stream.repeatEval(IO.blocking(readFrame(capture))).unNoneTerminate,
+      bytes => IO.blocking(playback.write(bytes, 0, bytes.length)).void,
+      "javasound"
+    )
+
+  def open(checkMuted: IO[Boolean])(using Raise[IO, AudioError]): Resource[IO, Handle] =
+    for
+      io <- pipewireIo.handleErrorWith((_: Throwable) => javaSoundIo)
       senders <- Resource.eval(Ref.of[IO, Map[String, Queue[IO, Array[Short]]]](Map.empty))
       hangover <- Resource.eval(Ref.of[IO, Int](0))
-    yield new Handle(senders, hangover, capture, playback, checkMuted)
+    yield new Handle(senders, hangover, io.frames, io.write, checkMuted, io.name)
 
   private def readFrame(line: TargetDataLine): Option[Array[Byte]] =
     val buf = new Array[Byte](frameBytes)
