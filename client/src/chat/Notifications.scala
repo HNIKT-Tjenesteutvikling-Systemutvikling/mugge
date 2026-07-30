@@ -114,14 +114,13 @@ object Notifications:
     }.rescue(err => logger.warn(s"[Notification Sound] ${err.message}"))
 
   def reminder(msg: String, myUsername: String, ui: Ui): IO[Unit] =
-    // REMIND:<from>:<HH:MM>:<text> — text is last and may contain ':'.
-    msg.split(":", 4) match
-      case Array(_, from, hhmm, text) =>
+    msg.split(":", 5) match
+      case Array(_, from, hh, mm, text) =>
         val fromSelf = from.equalsIgnoreCase(myUsername)
         val title = if fromSelf then "⏰ Reminder" else s"⏰ Reminder from $from"
         val line =
-          if fromSelf then s"$serverColor⏰ Reminder (set for $hhmm): $text$ansiReset"
-          else s"$serverColor⏰ Reminder from $from (set for $hhmm): $text$ansiReset"
+          if fromSelf then s"$serverColor⏰ Reminder (set for $hh:$mm): $text$ansiReset"
+          else s"$serverColor⏰ Reminder from $from (set for $hh:$mm): $text$ansiReset"
         ui.printLine(line) *>
           send(title, text, urgency = "critical", timeout = 0)
       case _ => IO.unit
