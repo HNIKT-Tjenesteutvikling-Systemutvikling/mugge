@@ -15,4 +15,5 @@ object UserMapping:
       case "sigubrat"       => "Sigurd"
       case "williams"       => "Sigurd"
       case "shitbox"        => "Leif"
+      case "ketil"          => "Ketil"
       case other            => other
