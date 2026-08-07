@@ -29,7 +29,7 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
     "/w"
   )
 
-  private val adminCommands = List("/ban", "/kick", "/unmute")
+  private val adminCommands = List("/ban", "/kick", "/server", "/unmute")
 
   override def complete(state: Ref[F, ClientState[F]], ui: Ui[F], ictl: InputCtl[F]): F[Unit] =
     ictl.pendingPaste.get.flatMap {

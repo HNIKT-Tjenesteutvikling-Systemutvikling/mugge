@@ -35,9 +35,16 @@ final class LiveNotifications[F[_]: Async: LoggerFactory] private (
     line match
       case messagePattern(_, sender, content) =>
         val mentions = mentionPattern.findAllMatchIn(content).map(_.group(1)).toSet
-        if mentions.exists(_.equalsIgnoreCase(myUsername)) then
+        val direct = mentions.exists(_.equalsIgnoreCase(myUsername))
+        // @all reaches the room, so it must not notify the sender of their own line.
+        val everyone =
+          mentions.exists(_.equalsIgnoreCase("all")) &&
+            !sender.trim.equalsIgnoreCase(myUsername)
+        if direct || everyone then
           send(
-            title = s"Chat: $sender mentioned you",
+            title =
+              if direct then s"Chat: $sender mentioned you"
+              else s"Chat: $sender mentioned everyone",
             body = content,
             urgency = "normal"
           )
