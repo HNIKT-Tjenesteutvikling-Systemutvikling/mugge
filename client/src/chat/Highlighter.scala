@@ -1,13 +1,17 @@
 package chat
 
-object Highlighter:
-  private val reset = "\u001b[0m"
-  private val keywordColor = "\u001b[38;5;175m"
-  private val stringColor = "\u001b[38;5;150m"
-  private val numberColor = "\u001b[38;5;180m"
-  private val commentColor = "\u001b[38;5;244m"
+trait Highlighter:
+  def normalizeLang(lang: String): String
+  def highlight(lang: String, line: String): String
 
-  private val scalaKeywords = Set(
+object Highlighter:
+  private[chat] val reset = "\u001b[0m"
+  private[chat] val keywordColor = "\u001b[38;5;175m"
+  private[chat] val stringColor = "\u001b[38;5;150m"
+  private[chat] val numberColor = "\u001b[38;5;180m"
+  private[chat] val commentColor = "\u001b[38;5;244m"
+
+  private[chat] val scalaKeywords = Set(
     "abstract",
     "case",
     "catch",
@@ -50,10 +54,10 @@ object Highlighter:
     "null"
   )
 
-  private val nixKeywords =
+  private[chat] val nixKeywords =
     Set("assert", "else", "if", "in", "inherit", "let", "or", "rec", "then", "with")
 
-  private val pythonKeywords = Set(
+  private[chat] val pythonKeywords = Set(
     "and",
     "as",
     "assert",
@@ -91,7 +95,7 @@ object Highlighter:
     "yield"
   )
 
-  private val elispKeywords = Set(
+  private[chat] val elispKeywords = Set(
     "defun",
     "defvar",
     "defcustom",
@@ -117,7 +121,7 @@ object Highlighter:
     "dotimes"
   )
 
-  private val javaKeywords = Set(
+  private[chat] val javaKeywords = Set(
     "abstract",
     "assert",
     "boolean",
@@ -178,7 +182,7 @@ object Highlighter:
     "null"
   )
 
-  private val javascriptKeywords = Set(
+  private[chat] val javascriptKeywords = Set(
     "async",
     "await",
     "break",
@@ -226,7 +230,7 @@ object Highlighter:
     "yield"
   )
 
-  private val typescriptKeywords = javascriptKeywords ++ Set(
+  private[chat] val typescriptKeywords = javascriptKeywords ++ Set(
     "abstract",
     "any",
     "as",
@@ -257,7 +261,7 @@ object Highlighter:
     "unknown"
   )
 
-  private val haskellKeywords = Set(
+  private[chat] val haskellKeywords = Set(
     "as",
     "case",
     "class",
@@ -290,7 +294,7 @@ object Highlighter:
     "where"
   )
 
-  private val rustKeywords = Set(
+  private[chat] val rustKeywords = Set(
     "as",
     "async",
     "await",
@@ -332,9 +336,12 @@ object Highlighter:
     "while"
   )
 
-  private val jsQuotes = Set('"', '\'', '`')
+  private[chat] val jsQuotes = Set('"', '\'', '`')
 
-  def normalizeLang(lang: String): String =
+final class LiveHighlighter private () extends Highlighter:
+  import Highlighter.*
+
+  override def normalizeLang(lang: String): String =
     lang.trim.toLowerCase match
       case "sc" | "scala"                => "scala"
       case "nix"                         => "nix"
@@ -347,7 +354,7 @@ object Highlighter:
       case "rs" | "rust"                 => "rust"
       case other                         => other
 
-  def highlight(lang: String, line: String): String =
+  override def highlight(lang: String, line: String): String =
     normalizeLang(lang) match
       case "scala"      => lex(line, scalaKeywords, "//")
       case "nix"        => lex(line, nixKeywords, "#")
@@ -401,3 +408,6 @@ object Highlighter:
         else loop(i + 1, acc + c)
 
     loop(0, "")
+
+object LiveHighlighter:
+  def apply(): Highlighter = new LiveHighlighter()

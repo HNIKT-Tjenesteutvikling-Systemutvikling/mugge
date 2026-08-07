@@ -1,9 +1,14 @@
 package chat
 
-import cats.effect.IO
+import cats.effect.Sync
+import cats.syntax.all.*
 import com.comcast.ip4s.*
 
 import scala.concurrent.duration.*
+
+trait Config[F[_]]:
+  def hostname: F[String]
+  def username: F[String]
 
 object Config:
   val defaultPort = port"20222"
@@ -19,25 +24,41 @@ object Config:
   // Wire-protocol version sent to the server on connect. Bump in BOTH repos
   // when a change makes older clients incompatible; the server refuses any
   // client below its required minimum with an update-and-rebuild message.
-  val protocolVersion = 8
+  val protocolVersion = 9
 
   val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 
   val noAssist: Boolean = sys.env.get("MUGGE_NO_ASSIST").contains("1")
 
+  // Companion socket for external frontends (VS Code sidebar, editors). They
+  // must drive this session instead of opening their own: the server displaces
+  // an older session when the same user reconnects.
+  val ipcEnabled: Boolean = !sys.env.get("MUGGE_NO_IPC").contains("1")
+
+  val ipcSocketPath: String =
+    sys.env
+      .get("MUGGE_IPC_SOCKET")
+      .orElse(sys.env.get("XDG_RUNTIME_DIR").map(dir => s"$dir/mugge-ipc.sock"))
+      .getOrElse(s"/tmp/mugge-ipc-${sys.props.getOrElse("user.name", "user")}.sock")
+
   val quitHint =
     "/quit is disabled here — this chat runs in the background. Press Ctrl-\\ " +
       "(or just close the terminal) to leave without disconnecting. To stop it " +
-      "entirely: systemctl --user stop mugge-chat"
+      "entirely: systemctl --user stop mugge-chat (Guix: herd stop mugge-chat)"
 
   val pingInterval = 60.seconds
 
-  def hostname: IO[String] =
+final class LiveConfig[F[_]: Sync] private (userMapping: UserMapping) extends Config[F]:
+  override def hostname: F[String] =
     sys.env.get("MUGGE_HOSTNAME") match
-      case Some(name) => IO.pure(name)
+      case Some(name) => name.pure[F]
       case None =>
-        IO.blocking(java.net.InetAddress.getLocalHost.getHostName)
+        Sync[F]
+          .blocking(java.net.InetAddress.getLocalHost.getHostName)
           .handleError(_ => "unknown-client")
 
-  def username: IO[String] =
-    hostname.map(UserMapping.mapHostname)
+  override def username: F[String] =
+    hostname.map(userMapping.mapHostname)
+
+object LiveConfig:
+  def apply[F[_]: Sync](userMapping: UserMapping): Config[F] = new LiveConfig[F](userMapping)

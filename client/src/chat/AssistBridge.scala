@@ -3,42 +3,49 @@ package chat
 import cats.effect.*
 import cats.effect.std.Console
 import cats.effect.std.Queue
+import cats.effect.syntax.all.*
 import cats.mtl.Handle.allow
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import fs2.*
 import fs2.io.net.*
-import org.typelevel.log4cats.Logger as TLogger
-import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.LoggerFactory
 
 import java.security.PrivateKey
 import java.util.Base64
 
 /** `--assist <user>` mode: pipes stdin/stdout of this process to a consenting user's shell. */
-object AssistBridge:
-  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
+trait AssistBridge[F[_]]:
+  def run(target: String, insecureTls: Boolean): F[ExitCode]
 
-  def run(target: String, insecureTls: Boolean): IO[ExitCode] =
+final class LiveAssistBridge[F[_]: Async: Network: Console: LoggerFactory] private (
+    config: Config[F],
+    authentication: Authentication[F],
+    tls: Tls[F]
+) extends AssistBridge[F]:
+  private val logger = LoggerFactory[F].getLogger
+
+  override def run(target: String, insecureTls: Boolean): F[ExitCode] =
     val host =
       sys.env.get("CHAT_SERVER_HOST").flatMap(Host.fromString).getOrElse(Config.defaultHost)
     val port =
       sys.env.get("CHAT_SERVER_PORT").flatMap(Port.fromString).getOrElse(Config.defaultPort)
     for
-      _ <- IO.whenA(insecureTls)(IO.println(Config.insecureTlsNotice))
+      _ <- Async[F].whenA(insecureTls)(Console[F].println(Config.insecureTlsNotice))
       githubUsername <- allow[Authentication.AuthError] {
-        Authentication.detectGithubUsername()
-      }.rescue(_ => IO.pure(None))
+        authentication.detectGithubUsername()
+      }.rescue(_ => Option.empty[String].pure[F])
       privateKey <- allow[Authentication.AuthError] {
-        Authentication.loadPrivateKey().map(_.some)
-      }.rescue(_ => IO.pure(None))
+        authentication.loadPrivateKey().map(_.some)
+      }.rescue(_ => Option.empty[PrivateKey].pure[F])
       code <- (githubUsername, privateKey) match
         case (Some(gh), Some(key)) =>
-          (if insecureTls then Network[IO].tlsContext.insecure else Tls.pinnedContext)
-            .flatMap { tls =>
-              Network[IO]
+          (if insecureTls then Network[F].tlsContext.insecure else tls.pinnedContext)
+            .flatMap { tlsContext =>
+              Network[F]
                 .connect(SocketAddress(host, port))
                 .use(raw =>
-                  tls
+                  tlsContext
                     .clientBuilder(raw)
                     .withParameters(Tls.parameters)
                     .build
@@ -47,7 +54,7 @@ object AssistBridge:
             }
             .handleErrorWith { err =>
               if Tls.isPinMismatch(err) then
-                Console[IO].errorln(Config.pinMismatchNotice).as(ExitCode.Success)
+                Console[F].errorln(Config.pinMismatchNotice).as(ExitCode.Success)
               else logger.error(s"Bridge connection failed: ${err.getMessage}").as(ExitCode.Error)
             }
         case _ =>
@@ -57,16 +64,16 @@ object AssistBridge:
     yield code
 
   private def session(
-      socket: Socket[IO],
+      socket: Socket[F],
       githubUsername: String,
       privateKey: PrivateKey,
       target: String
-  ): IO[ExitCode] =
+  ): F[ExitCode] =
     for
-      hostname <- Config.hostname
-      outQ <- Queue.unbounded[IO, String]
-      done <- Deferred[IO, ExitCode]
-      stdinFib <- Ref.of[IO, Option[Fiber[IO, Throwable, Unit]]](None)
+      hostname <- config.hostname
+      outQ <- Queue.unbounded[F, String]
+      done <- Deferred[F, ExitCode]
+      stdinFib <- Ref.of[F, Option[Fiber[F, Throwable, Unit]]](None)
       _ <- outQ.offer(
         s"$hostname\nproto:${Config.protocolVersion}\nauto-auth:$githubUsername\nassist-bridge:1\n\n"
       )
@@ -80,7 +87,7 @@ object AssistBridge:
         .filter(_.nonEmpty)
         .evalMap(line => handleLine(line, outQ, done, stdinFib, privateKey, target))
         .onFinalize(done.complete(ExitCode.Error).attempt.void)
-      pinger = Stream.awakeEvery[IO](Config.pingInterval).evalMap(_ => outQ.offer("PING\n"))
+      pinger = Stream.awakeEvery[F](Config.pingInterval).evalMap(_ => outQ.offer("PING\n"))
       pumps <- Stream(reader.drain, writer.drain, pinger.drain).parJoinUnbounded.compile.drain.start
       code <- done.get
         .guarantee(pumps.cancel *> stdinFib.get.flatMap(_.traverse_(_.cancel)))
@@ -88,15 +95,15 @@ object AssistBridge:
 
   private def handleLine(
       line: String,
-      outQ: Queue[IO, String],
-      done: Deferred[IO, ExitCode],
-      stdinFib: Ref[IO, Option[Fiber[IO, Throwable, Unit]]],
+      outQ: Queue[F, String],
+      done: Deferred[F, ExitCode],
+      stdinFib: Ref[F, Option[Fiber[F, Throwable, Unit]]],
       privateKey: PrivateKey,
       target: String
-  ): IO[Unit] =
+  ): F[Unit] =
     if line.startsWith("CHALLENGE:") then
       allow[Authentication.AuthError] {
-        Authentication
+        authentication
           .signChallenge(line.drop("CHALLENGE:".length), privateKey)
           .flatMap(sig => outQ.offer(s"SIGNATURE:$sig\n"))
       }.rescue { err =>
@@ -111,23 +118,24 @@ object AssistBridge:
         done.complete(ExitCode.Error).void
     else if line.startsWith("ASSISTDATA:") then
       line.split(":", 3) match
-        case Array(_, _, b64) => IO(Base64.getDecoder.decode(b64)).flatMap(writeStdout)
-        case _                => IO.unit
+        case Array(_, _, b64) =>
+          Sync[F].delay(Base64.getDecoder.decode(b64)).flatMap(writeStdout)
+        case _ => ().pure[F]
     else if line.startsWith("ASSISTEND:") then done.complete(ExitCode.Success).void
     else if line.startsWith("INCOMPATIBLE:") then
-      Console[IO].errorln(line.drop("INCOMPATIBLE:".length)) *> done.complete(ExitCode.Error).void
+      Console[F].errorln(line.drop("INCOMPATIBLE:".length)) *> done.complete(ExitCode.Error).void
     else if line.startsWith("DENIED:") then
-      Console[IO].errorln(line.drop("DENIED:".length)) *> done.complete(ExitCode.Success).void
-    else IO.unit
+      Console[F].errorln(line.drop("DENIED:".length)) *> done.complete(ExitCode.Success).void
+    else ().pure[F]
 
   private def startPump(
       id: String,
-      outQ: Queue[IO, String],
-      done: Deferred[IO, ExitCode],
-      stdinFib: Ref[IO, Option[Fiber[IO, Throwable, Unit]]]
-  ): IO[Unit] =
+      outQ: Queue[F, String],
+      done: Deferred[F, ExitCode],
+      stdinFib: Ref[F, Option[Fiber[F, Throwable, Unit]]]
+  ): F[Unit] =
     fs2.io
-      .stdin[IO](64 * 1024)
+      .stdin[F](64 * 1024)
       .chunks
       .evalMap(chunk =>
         outQ.offer(s"ASSISTDATA:$id:${Base64.getEncoder.encodeToString(chunk.toArray)}\n")
@@ -140,5 +148,12 @@ object AssistBridge:
       .start
       .flatMap(fib => stdinFib.set(Some(fib)))
 
-  private def writeStdout(bytes: Array[Byte]): IO[Unit] =
-    IO.blocking { System.out.write(bytes); System.out.flush() }
+  private def writeStdout(bytes: Array[Byte]): F[Unit] =
+    Sync[F].blocking { System.out.write(bytes); System.out.flush() }
+
+object LiveAssistBridge:
+  def apply[F[_]: Async: Network: Console: LoggerFactory](
+      config: Config[F],
+      authentication: Authentication[F],
+      tls: Tls[F]
+  ): AssistBridge[F] = new LiveAssistBridge[F](config, authentication, tls)

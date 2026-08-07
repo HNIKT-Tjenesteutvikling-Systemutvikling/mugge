@@ -1,5 +1,6 @@
 package chat
 
+import cats.Applicative
 import cats.effect.*
 import cats.effect.std.Console
 import cats.effect.std.Mutex
@@ -10,27 +11,49 @@ import Ansi.*
 /** Owns the terminal: the chat scrollback, the input block and the online-user side panel, all
   * repainted under a single mutex so concurrent writers never interleave.
   */
-final class Ui(
-    mutex: Mutex[IO],
-    state: Ref[IO, ClientState],
-    ictl: InputCtl,
-    blockLines: Ref[IO, Int],
+trait Ui[F[_]]:
+  def isTty: Boolean
+  def printLine(line: String): F[Unit]
+  def printLines(lines: List[String]): F[Unit]
+  def printCodeBlock(
+      time: String,
+      indicator: String,
+      sender: String,
+      lang: String,
+      code: List[String]
+  ): F[Unit]
+  def setUsers(users: List[String]): F[Unit]
+  def setStatuses(name: String, status: Option[String]): F[Unit]
+  def setVoiceUsers(users: List[String]): F[Unit]
+  def setTyping(users: List[String]): F[Unit]
+  def refreshInput: F[Unit]
+  def redraw: F[Unit]
+  def colorize(msg: String, state: Ref[F, ClientState[F]], withStatus: Boolean = true): F[String]
+
+final class LiveUi[F[_]: Async: Console] private (
+    mutex: Mutex[F],
+    state: Ref[F, ClientState[F]],
+    ictl: InputCtl[F],
+    blockLines: Ref[F, Int],
     pty: Boolean,
-    termSize: Ref[IO, Option[(Int, Int)]],
-    scrollback: Ref[IO, Vector[String]]
-):
-  import Ui.*
+    termSize: Ref[F, Option[(Int, Int)]],
+    scrollback: Ref[F, Vector[String]],
+    ansi: Ansi,
+    highlighter: Highlighter,
+    terminal: Terminal[F]
+) extends Ui[F]:
+  private val panelWidth = 24
 
-  def isTty: Boolean = pty
+  private val inputPrompt = "> "
 
-  private def plainPrint(line: String): IO[Unit] =
-    if pty then Console[IO].print(line + "\r\n") else Console[IO].println(line)
+  // dtach keeps no scrollback, so the client keeps its own to repaint on attach.
+  private val scrollbackSize = 200
 
-  // Stored pre-wrap so a redraw re-wraps at the current width.
-  private def appendScrollback(line: String): IO[Unit] =
-    scrollback.update(v => (v :+ line).takeRight(scrollbackSize))
+  private val codeBorderColor = "\u001b[38;5;240m"
 
-  def printLine(line: String): IO[Unit] =
+  override def isTty: Boolean = pty
+
+  override def printLine(line: String): F[Unit] =
     mutex.lock.surround {
       appendScrollback(line) *>
         termSize.get.flatMap {
@@ -39,8 +62,8 @@ final class Ui(
         }
     }
 
-  def printLines(lines: List[String]): IO[Unit] =
-    if lines.isEmpty then IO.unit
+  override def printLines(lines: List[String]): F[Unit] =
+    if lines.isEmpty then Applicative[F].unit
     else
       mutex.lock.surround {
         termSize.get.flatMap {
@@ -51,13 +74,13 @@ final class Ui(
         }
       }
 
-  def printCodeBlock(
+  override def printCodeBlock(
       time: String,
       indicator: String,
       sender: String,
       lang: String,
       code: List[String]
-  ): IO[Unit] =
+  ): F[Unit] =
     colorIndexFor(sender, state).flatMap { idx =>
       val header = s"[$time] $indicator ${ansiPalette(idx)}$sender$ansiReset:"
       termSize.get.flatMap {
@@ -69,7 +92,114 @@ final class Ui(
       }
     }
 
-  private val codeBorderColor = "\u001b[38;5;240m"
+  override def setUsers(users: List[String]): F[Unit] =
+    state
+      .modify { st =>
+        val pruned = st.statuses.filter((name, _) => users.contains(name))
+        val changed = st.onlineUsers != users || st.statuses != pruned
+        (st.copy(onlineUsers = users, statuses = pruned), changed)
+      }
+      .flatMap { changed =>
+        if !changed then Applicative[F].unit
+        else
+          mutex.lock.surround {
+            termSize.get.flatMap {
+              case None if pty        => Applicative[F].unit
+              case None               => plainPrint(s"Online: ${users.mkString(", ")}")
+              case Some((cols, rows)) => render(None, cols, rows)
+            }
+          }
+      }
+
+  override def setStatuses(name: String, status: Option[String]): F[Unit] =
+    state
+      .modify { st =>
+        val updated = status.fold(st.statuses - name)(s => st.statuses + (name -> s))
+        (st.copy(statuses = updated), st.statuses != updated)
+      }
+      .flatMap { changed =>
+        if !changed then Applicative[F].unit
+        else
+          mutex.lock.surround {
+            termSize.get.flatMap {
+              case None               => Applicative[F].unit
+              case Some((cols, rows)) => render(None, cols, rows)
+            }
+          }
+      }
+
+  override def setVoiceUsers(users: List[String]): F[Unit] =
+    state.modify(st => (st.copy(voiceUsers = users), st.voiceUsers != users)).flatMap { changed =>
+      if !changed then Applicative[F].unit
+      else
+        mutex.lock.surround {
+          termSize.get.flatMap {
+            case None               => Applicative[F].unit
+            case Some((cols, rows)) => render(None, cols, rows)
+          }
+        }
+    }
+
+  override def setTyping(users: List[String]): F[Unit] =
+    state.modify(st => (st.copy(typingUsers = users), st.typingUsers != users)).flatMap { changed =>
+      if !changed then Applicative[F].unit
+      else
+        mutex.lock.surround {
+          termSize.get.flatMap {
+            case None               => Applicative[F].unit
+            case Some((cols, rows)) => render(None, cols, rows)
+          }
+        }
+    }
+
+  override def refreshInput: F[Unit] =
+    mutex.lock.surround {
+      termSize.get.flatMap {
+        case None               => Applicative[F].unit
+        case Some((cols, rows)) => render(None, cols, rows)
+      }
+    }
+
+  // Re-detect the size first so it repaints straight out of the headless
+  // (None) state on the first attach, before the watcher poll lands.
+  override def redraw: F[Unit] =
+    terminal.size.flatMap { latest =>
+      mutex.lock.surround {
+        termSize.set(latest) *> (latest match
+          case None               => Applicative[F].unit
+          case Some((cols, rows)) => fullRepaint(cols, rows)
+        )
+      }
+    }
+
+  override def colorize(
+      msg: String,
+      state: Ref[F, ClientState[F]],
+      withStatus: Boolean = true
+  ): F[String] =
+    msg match
+      case Markup.displayPattern(time, indicator, sender, content) =>
+        if sender.trim == "SERVER" then
+          (s"[$time] $indicator $serverColor$sender$ansiReset: " +
+            s"$serverColor${ansi.linkify(content)}$ansiReset").pure[F]
+        else
+          (colorIndexFor(sender.trim, state), state.get).flatMapN { (idx, st) =>
+            val bright = ansiPalette(idx)
+            val dim = ansiDimPalette(idx)
+            val status =
+              if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
+            val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
+            (s"[$time] $indicator $bright$sender$ansiReset$statusPart: " +
+              s"$dim${ansi.linkify(content)}$ansiReset").pure[F]
+          }
+      case _ => msg.pure[F]
+
+  private def plainPrint(line: String): F[Unit] =
+    if pty then Console[F].print(line + "\r\n") else Console[F].println(line)
+
+  // Stored pre-wrap so a redraw re-wraps at the current width.
+  private def appendScrollback(line: String): F[Unit] =
+    scrollback.update(v => (v :+ line).takeRight(scrollbackSize))
 
   private def codeBoxLines(lang: String, code: List[String], width: Int): List[String] =
     val boxW = math.max(8, width)
@@ -79,98 +209,18 @@ final class Ui(
       s"┐$ansiReset"
     val bottom = s"$codeBorderColor└" + "─" * (boxW - 2) + s"┘$ansiReset"
     val rows = code.flatMap { raw =>
-      val wrapped = wrapAnsi(Highlighter.highlight(lang, raw), innerW) match
+      val wrapped = ansi.wrapAnsi(highlighter.highlight(lang, raw), innerW) match
         case Nil  => List("")
         case rows => rows
       wrapped.zipWithIndex.map { (row, idx) =>
         val gutter = if idx == 0 then " " else s"\u001b[2m↳$ansiReset"
-        s"$codeBorderColor│$ansiReset$gutter${padVisible(row, innerW)} " +
+        s"$codeBorderColor│$ansiReset$gutter${ansi.padVisible(row, innerW)} " +
           s"$codeBorderColor│$ansiReset"
       }
     }
     top :: rows ::: List(bottom)
 
-  def setUsers(users: List[String]): IO[Unit] =
-    state
-      .modify { st =>
-        val pruned = st.statuses.filter((name, _) => users.contains(name))
-        val changed = st.onlineUsers != users || st.statuses != pruned
-        (st.copy(onlineUsers = users, statuses = pruned), changed)
-      }
-      .flatMap { changed =>
-        if !changed then IO.unit
-        else
-          mutex.lock.surround {
-            termSize.get.flatMap {
-              case None if pty        => IO.unit
-              case None               => plainPrint(s"Online: ${users.mkString(", ")}")
-              case Some((cols, rows)) => render(None, cols, rows)
-            }
-          }
-      }
-
-  def setStatuses(name: String, status: Option[String]): IO[Unit] =
-    state
-      .modify { st =>
-        val updated = status.fold(st.statuses - name)(s => st.statuses + (name -> s))
-        (st.copy(statuses = updated), st.statuses != updated)
-      }
-      .flatMap { changed =>
-        if !changed then IO.unit
-        else
-          mutex.lock.surround {
-            termSize.get.flatMap {
-              case None               => IO.unit
-              case Some((cols, rows)) => render(None, cols, rows)
-            }
-          }
-      }
-
-  def setVoiceUsers(users: List[String]): IO[Unit] =
-    state.modify(st => (st.copy(voiceUsers = users), st.voiceUsers != users)).flatMap { changed =>
-      if !changed then IO.unit
-      else
-        mutex.lock.surround {
-          termSize.get.flatMap {
-            case None               => IO.unit
-            case Some((cols, rows)) => render(None, cols, rows)
-          }
-        }
-    }
-
-  def setTyping(users: List[String]): IO[Unit] =
-    state.modify(st => (st.copy(typingUsers = users), st.typingUsers != users)).flatMap { changed =>
-      if !changed then IO.unit
-      else
-        mutex.lock.surround {
-          termSize.get.flatMap {
-            case None               => IO.unit
-            case Some((cols, rows)) => render(None, cols, rows)
-          }
-        }
-    }
-
-  def refreshInput: IO[Unit] =
-    mutex.lock.surround {
-      termSize.get.flatMap {
-        case None               => IO.unit
-        case Some((cols, rows)) => render(None, cols, rows)
-      }
-    }
-
-  // Re-detect the size first so it repaints straight out of the headless
-  // (None) state on the first attach, before the watcher poll lands.
-  def redraw: IO[Unit] =
-    Terminal.size.flatMap { latest =>
-      mutex.lock.surround {
-        termSize.set(latest) *> (latest match
-          case None               => IO.unit
-          case Some((cols, rows)) => fullRepaint(cols, rows)
-        )
-      }
-    }
-
-  private def fullRepaint(cols: Int, rows: Int): IO[Unit] =
+  private def fullRepaint(cols: Int, rows: Int): F[Unit] =
     for
       st <- state.get
       inp <- ictl.text.get
@@ -189,16 +239,16 @@ final class Ui(
       (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
       sb = new StringBuilder
       _ = sb.append("\u001b[2J\u001b[H")
-      _ = ring.foreach(l => wrapAnsi(l, textWidth).foreach(r => sb.append(r).append("\n")))
+      _ = ring.foreach(l => ansi.wrapAnsi(l, textWidth).foreach(r => sb.append(r).append("\n")))
       _ = sb.append(blockStr)
       _ = sb.append(
         panelStr(colored, st.voiceUsers.toSet, st.onlineUsers.size, startCol, clearRows)
       )
-      _ <- Console[IO].print(sb.toString)
+      _ <- Console[F].print(sb.toString)
       _ <- blockLines.set(newCount)
     yield ()
 
-  private def render(chat: Option[String], cols: Int, rows: Int): IO[Unit] =
+  private def render(chat: Option[String], cols: Int, rows: Int): F[Unit] =
     for
       st <- state.get
       inp <- ictl.text.get
@@ -217,12 +267,12 @@ final class Ui(
       (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
       sb = new StringBuilder
       _ = sb.append(eraseBlock(prev))
-      _ = chat.foreach(l => wrapAnsi(l, textWidth).foreach(r => sb.append(r).append("\n")))
+      _ = chat.foreach(l => ansi.wrapAnsi(l, textWidth).foreach(r => sb.append(r).append("\n")))
       _ = sb.append(blockStr)
       _ = sb.append(
         panelStr(colored, st.voiceUsers.toSet, st.onlineUsers.size, startCol, clearRows)
       )
-      _ <- Console[IO].print(sb.toString)
+      _ <- Console[F].print(sb.toString)
       _ <- blockLines.set(newCount)
     yield ()
 
@@ -233,14 +283,14 @@ final class Ui(
       s"\r$up\u001b[0J"
 
   private def renderBlock(
-      st: ClientState,
+      st: ClientState[F],
       inp: String,
       paste: Option[PendingPaste],
       hint: Option[String],
       width: Int,
       rows: Int
   ): (String, Int) =
-    def dim(s: String) = s"\u001b[2m${wrapAnsi(s, width).head}$ansiReset"
+    def dim(s: String) = s"\u001b[2m${ansi.wrapAnsi(s, width).head}$ansiReset"
     val hintRow = hint.map(dim)
     val typingRow = formatTyping(st.typingUsers).map(dim)
     val pasteTag =
@@ -250,13 +300,12 @@ final class Ui(
           case Some(_) => s"\u001b[2m[code: ${math.max(0, lines - 2)} lines]$ansiReset"
           case None    => s"\u001b[2m[paste: $lines lines]$ansiReset"
       }
-    // Split on typed newlines (Alt/Shift+Enter), wrap each, tail-follow.
     val inputRows =
       (inputPrompt + inp + pasteTag)
         .split("\n", -1)
         .toList
         .flatMap(seg =>
-          wrapAnsi(seg, width) match
+          ansi.wrapAnsi(seg, width) match
             case Nil => List("")
             case rs  => rs
         )
@@ -295,14 +344,6 @@ final class Ui(
       case _ =>
         s"$bright${if name.length > avail then name.take(avail) else name}$ansiReset"
 
-object Ui:
-  private val panelWidth = 24
-
-  private val inputPrompt = "> "
-
-  // dtach keeps no scrollback, so the client keeps its own to repaint on attach.
-  private val scrollbackSize = 200
-
   private def formatTyping(users: List[String]): Option[String] =
     users match
       case Nil      => None
@@ -311,37 +352,43 @@ object Ui:
         val init = users.init.mkString(", ")
         Some(s"$init and ${users.last} is typing...")
 
-  private def colorIndexFor(name: String, state: Ref[IO, ClientState]): IO[Int] =
+  private def colorIndexFor(name: String, state: Ref[F, ClientState[F]]): F[Int] =
     state.modify { st =>
       st.colors.get(name) match
         case Some(idx) => (st, idx)
-        case None =>
-          val idx = st.colors.size % ansiPalette.size
+        case None      =>
+          // Only colours in use by someone online are off limits; names that
+          // left or were renamed away release theirs, so a long session does
+          // not wrap around and hand two people in the room the same colour.
+          val live = (st.onlineUsers.toSet - name).flatMap(st.colors.get)
+          val idx = ansiPalette.indices
+            .find(!live.contains(_))
+            .getOrElse(st.colors.size % ansiPalette.size)
           (st.copy(colors = st.colors + (name -> idx)), idx)
     }
 
-  def colorize(
-      msg: String,
-      state: Ref[IO, ClientState],
-      withStatus: Boolean = true
-  ): IO[String] =
-    msg match
-      case Markup.displayPattern(time, indicator, sender, content) =>
-        if sender.trim == "SERVER" then
-          IO.pure(
-            s"[$time] $indicator $serverColor$sender$ansiReset: " +
-              s"$serverColor${linkify(content)}$ansiReset"
-          )
-        else
-          (colorIndexFor(sender.trim, state), state.get).flatMapN { (idx, st) =>
-            val bright = ansiPalette(idx)
-            val dim = ansiDimPalette(idx)
-            val status =
-              if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
-            val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
-            IO.pure(
-              s"[$time] $indicator $bright$sender$ansiReset$statusPart: " +
-                s"$dim${linkify(content)}$ansiReset"
-            )
-          }
-      case _ => IO.pure(msg)
+object LiveUi:
+  def apply[F[_]: Async: Console](
+      mutex: Mutex[F],
+      state: Ref[F, ClientState[F]],
+      ictl: InputCtl[F],
+      blockLines: Ref[F, Int],
+      pty: Boolean,
+      termSize: Ref[F, Option[(Int, Int)]],
+      scrollback: Ref[F, Vector[String]],
+      ansi: Ansi,
+      highlighter: Highlighter,
+      terminal: Terminal[F]
+  ): Ui[F] =
+    new LiveUi[F](
+      mutex,
+      state,
+      ictl,
+      blockLines,
+      pty,
+      termSize,
+      scrollback,
+      ansi,
+      highlighter,
+      terminal
+    )

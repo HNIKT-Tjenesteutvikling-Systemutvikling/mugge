@@ -38,34 +38,27 @@ object InputHistory:
         (h.copy(pos = None, draft = ""), Some(h.draft))
       case Some(i) => (h.copy(pos = Some(i + 1)), Some(h.entries(i + 1)))
 
-final case class InputCtl(
-    text: Ref[IO, String],
-    hint: Ref[IO, Option[String]],
-    pendingPaste: Ref[IO, Option[PendingPaste]],
-    paste: Ref[IO, Option[(List[Char], Int)]],
-    composing: Ref[IO, Boolean],
-    history: Ref[IO, InputHistory]
+final case class InputCtl[F[_]](
+    text: Ref[F, String],
+    hint: Ref[F, Option[String]],
+    pendingPaste: Ref[F, Option[PendingPaste]],
+    paste: Ref[F, Option[(List[Char], Int)]],
+    composing: Ref[F, Boolean],
+    history: Ref[F, InputHistory]
 )
 
 enum InputToken:
   case Ch(c: Char)
   case PasteStart, PasteEnd, Newline, HistoryPrev, HistoryNext
 
-object InputToken:
-  private enum EscState:
-    case Ground, Esc, Ss3
-    case Csi(params: String)
+trait Tokenizer[F[_]]:
+  def tokenize(chars: Stream[F, Char]): Stream[F, InputToken]
 
-  // Kitty keyboard protocol: a modified Enter (e.g. Shift+Enter -> ESC[13;2u)
-  // inserts a newline; an unmodified one still submits.
-  private def csiUToken(params: String): List[InputToken] =
-    params.split(";").toList match
-      case key :: rest if key == "13" || key == "10" =>
-        val mod = rest.headOption.map(_.takeWhile(_.isDigit)).flatMap(_.toIntOption).getOrElse(1)
-        if mod > 1 then List(InputToken.Newline) else List(InputToken.Ch('\r'))
-      case _ => Nil
+final class LiveTokenizer[F[_]] private () extends Tokenizer[F]:
+  import LiveTokenizer.EscState
+  import LiveTokenizer.csiUToken
 
-  def tokenize(chars: Stream[IO, Char]): Stream[IO, InputToken] =
+  override def tokenize(chars: Stream[F, Char]): Stream[F, InputToken] =
     chars
       .mapAccumulate(EscState.Ground: EscState) { (st, c) =>
         st match
@@ -96,3 +89,19 @@ object InputToken:
             else (EscState.Csi(params + c), Nil)
       }
       .flatMap((_, toks) => Stream.emits(toks))
+
+object LiveTokenizer:
+  private enum EscState:
+    case Ground, Esc, Ss3
+    case Csi(params: String)
+
+  // Kitty keyboard protocol: a modified Enter (e.g. Shift+Enter -> ESC[13;2u)
+  // inserts a newline; an unmodified one still submits.
+  private def csiUToken(params: String): List[InputToken] =
+    params.split(";").toList match
+      case key :: rest if key == "13" || key == "10" =>
+        val mod = rest.headOption.map(_.takeWhile(_.isDigit)).flatMap(_.toIntOption).getOrElse(1)
+        if mod > 1 then List(InputToken.Newline) else List(InputToken.Ch('\r'))
+      case _ => Nil
+
+  def apply[F[_]](): Tokenizer[F] = new LiveTokenizer[F]()

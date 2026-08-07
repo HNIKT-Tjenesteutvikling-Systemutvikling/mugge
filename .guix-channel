@@ -1,0 +1,11 @@
+;; Makes this repository usable as a Guix channel:
+;;
+;;   (channel (name 'mugge)
+;;            (url "https://github.com/HNIKT-Tjenesteutvikling-Systemutvikling/mugge"))
+;;
+;; The channel is unauthenticated (no `.guix-authorizations' / introduction),
+;; so `guix pull' warns about it; add an introduction once release commits are
+;; OpenPGP-signed.
+(channel
+  (version 0)
+  (directory "guix"))

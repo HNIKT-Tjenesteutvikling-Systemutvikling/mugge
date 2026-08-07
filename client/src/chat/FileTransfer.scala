@@ -3,6 +3,7 @@ package chat
 import cats.effect.*
 import cats.effect.std.Queue
 import cats.effect.std.UUIDGen
+import cats.effect.syntax.all.*
 import cats.mtl.Handle.allow
 import cats.mtl.Raise as MtlRaise
 import cats.syntax.all.*
@@ -26,18 +27,43 @@ case class IncomingFile(
     received: Long = 0
 )
 
+private[chat] enum FileError:
+  case NotFound(path: String)
+  case NotRegular(path: String)
+  case NotReadable(path: String)
+  case TooLarge(size: Long)
+  case Unreadable(detail: String)
+  case ChecksumMismatch(name: String)
+
 /** Chunked, base64 file transfer over the chat socket, checksummed end to end. */
-object FileTransfer:
+trait FileTransfer[F[_]]:
+  def prepareSend(
+      rest: String,
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F]
+  ): F[Unit]
+
+  def offer(msg: String, state: Ref[F, ClientState[F]], ui: Ui[F]): F[Unit]
+
+  def accept(
+      id: String,
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F]
+  ): F[Unit]
+
+  def reject(id: String, state: Ref[F, ClientState[F]], ui: Ui[F]): F[Unit]
+
+  def data(msg: String, state: Ref[F, ClientState[F]], ui: Ui[F]): F[Unit]
+
+  def end(msg: String, state: Ref[F, ClientState[F]], ui: Ui[F]): F[Unit]
+
+final class LiveFileTransfer[F[_]: Async: Fs2Files: UUIDGen] private (
+    notifications: Notifications[F]
+) extends FileTransfer[F]:
   private val maxFileSize = 10L * 1024 * 1024
   private val fileChunkSize = 48 * 1024
-
-  private enum FileError:
-    case NotFound(path: String)
-    case NotRegular(path: String)
-    case NotReadable(path: String)
-    case TooLarge(size: Long)
-    case Unreadable(detail: String)
-    case ChecksumMismatch(name: String)
 
   private def fileErrorMessage(e: FileError): String = e match
     case FileError.NotFound(p)         => s"File not found: $p"
@@ -47,7 +73,7 @@ object FileTransfer:
     case FileError.Unreadable(d)       => s"Could not read file: $d"
     case FileError.ChecksumMismatch(n) => s"Checksum mismatch for $n; download discarded."
 
-  private def raiseFile[A](e: FileError)(using r: MtlRaise[IO, FileError]): IO[A] =
+  private def raiseFile[A](e: FileError)(using r: MtlRaise[F, FileError]): F[A] =
     r.raise(e)
 
   private def progressMilestone(prev: Long, now: Long, total: Long): Option[Int] =
@@ -57,18 +83,18 @@ object FileTransfer:
       val n = (now * 4 / total).toInt
       if n > p && n < 4 then Some(n * 25) else None
 
-  def prepareSend(
+  override def prepareSend(
       rest: String,
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F]
+  ): F[Unit] =
     rest.trim.split(" ", 2) match
       case Array(targetToken, rawPath) if targetToken.startsWith("@") =>
         val path = Paths.get(rawPath.trim)
         allow[FileError] {
           for
-            checked <- IO.blocking {
+            checked <- Sync[F].blocking {
               val regular = Files.isRegularFile(path)
               val readable = regular && Files.isReadable(path)
               val size = if regular then Files.size(path) else -1L
@@ -80,8 +106,8 @@ object FileTransfer:
               case Right((_, false, _, _)) => raiseFile(FileError.NotRegular(rawPath))
               case Right((_, _, false, _)) => raiseFile(FileError.NotReadable(rawPath))
               case Right((_, _, _, s)) if s > maxFileSize => raiseFile(FileError.TooLarge(s))
-              case Right((_, _, _, s))                    => IO.pure(s)
-            id <- UUIDGen[IO].randomUUID.map(_.toString.take(8))
+              case Right((_, _, _, s))                    => s.pure[F]
+            id <- UUIDGen[F].randomUUID.map(_.toString.take(8))
             name = path.getFileName.toString
             _ <- state.update(st =>
               st.copy(outgoingFiles = st.outgoingFiles + (id -> OutgoingFile(path, name, size)))
@@ -92,11 +118,11 @@ object FileTransfer:
       case _ =>
         ui.printLine("Usage: /sendfile @user <path>")
 
-  def offer(
+  override def offer(
       msg: String,
-      state: Ref[IO, ClientState],
-      ui: Ui
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      ui: Ui[F]
+  ): F[Unit] =
     msg.split(":", 5) match
       case Array(_, id, from, sizeStr, name) =>
         val size = sizeStr.toLongOption.getOrElse(0L)
@@ -108,84 +134,87 @@ object FileTransfer:
             s"$from wants to send \"$safe\" ($size bytes). " +
               s"Accept with /acceptfile $id or decline with /rejectfile $id"
           ) *>
-          Notifications.send(
+          notifications.send(
             title = s"📎 File offer from $from",
             body = s"$safe ($size bytes) — /acceptfile $id or /rejectfile $id",
             urgency = "critical",
             timeout = 0
           )
-      case _ => IO.unit
+      case _ => ().pure[F]
 
-  def accept(
+  override def accept(
       id: String,
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F]
+  ): F[Unit] =
     state
       .modify(st => (st.copy(outgoingFiles = st.outgoingFiles - id), st.outgoingFiles.get(id)))
       .flatMap {
         case Some(out) =>
           ui.printLine(s"Offer accepted; sending ${out.name}...") *>
             sendFileData(id, out, outgoingQueue, ui).start.void
-        case None => IO.unit
+        case None => ().pure[F]
       }
 
   private def sendFileData(
       id: String,
       out: OutgoingFile,
-      outgoingQueue: Queue[IO, String],
-      ui: Ui
-  ): IO[Unit] =
-    (IO(MessageDigest.getInstance("SHA-256")), Ref.of[IO, Long](0L)).flatMapN { (md, sent) =>
-      Fs2Files[IO]
-        .readAll(Fs2Path.fromNioPath(out.path))
-        .chunkN(fileChunkSize)
-        .zipWithIndex
-        .evalMap { case (chunk, seq) =>
-          val bytes = chunk.toArray
-          IO(md.update(bytes)) *>
-            outgoingQueue.offer(s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(bytes)}") *>
-            sent
-              .modify { prev =>
-                val now = prev + bytes.length
-                (now, progressMilestone(prev, now, out.size))
-              }
-              .flatMap(_.traverse_(pct => ui.printLine(s"Sending ${out.name}... $pct%")))
-        }
-        .compile
-        .drain
-        .flatMap(_ => outgoingQueue.offer(s"FILEEND:$id:${toHex(md.digest())}"))
-        .flatMap(_ => ui.printLine(s"Sent ${out.name} (${out.size} bytes)."))
-        .handleErrorWith(err => ui.printLine(s"Failed to send ${out.name}: ${err.getMessage}"))
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F]
+  ): F[Unit] =
+    (Sync[F].delay(MessageDigest.getInstance("SHA-256")), Ref.of[F, Long](0L)).flatMapN {
+      (md, sent) =>
+        Fs2Files[F]
+          .readAll(Fs2Path.fromNioPath(out.path))
+          .chunkN(fileChunkSize)
+          .zipWithIndex
+          .evalMap { case (chunk, seq) =>
+            val bytes = chunk.toArray
+            Sync[F].delay(md.update(bytes)) *>
+              outgoingQueue.offer(
+                s"FILEDATA:$id:$seq:${Base64.getEncoder.encodeToString(bytes)}"
+              ) *>
+              sent
+                .modify { prev =>
+                  val now = prev + bytes.length
+                  (now, progressMilestone(prev, now, out.size))
+                }
+                .flatMap(_.traverse_(pct => ui.printLine(s"Sending ${out.name}... $pct%")))
+          }
+          .compile
+          .drain
+          .flatMap(_ => outgoingQueue.offer(s"FILEEND:$id:${toHex(md.digest())}"))
+          .flatMap(_ => ui.printLine(s"Sent ${out.name} (${out.size} bytes)."))
+          .handleErrorWith(err => ui.printLine(s"Failed to send ${out.name}: ${err.getMessage}"))
     }
 
-  def reject(
+  override def reject(
       id: String,
-      state: Ref[IO, ClientState],
-      ui: Ui
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      ui: Ui[F]
+  ): F[Unit] =
     state
       .modify(st => (st.copy(outgoingFiles = st.outgoingFiles - id), st.outgoingFiles.get(id)))
       .flatMap {
         case Some(out) => ui.printLine(s"${out.name} was rejected by the recipient.")
-        case None      => IO.unit
+        case None      => ().pure[F]
       }
 
-  def data(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
+  override def data(msg: String, state: Ref[F, ClientState[F]], ui: Ui[F]): F[Unit] =
     msg.split(":", 4) match
       case Array(_, id, _, b64) =>
         state.get.map(_.incomingFiles.get(id)).flatMap {
-          case None => IO.unit
+          case None => ().pure[F]
           case Some(incoming) =>
             val bytes = Base64.getDecoder.decode(b64)
             val write = incoming.temp match
               case Some(tmp) =>
-                IO.blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND)).void
+                Sync[F].blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND)).void
               case None =>
                 for
-                  tmp <- IO.blocking(Files.createTempFile("mugge-", ".part"))
-                  _ <- IO.blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND))
+                  tmp <- Sync[F].blocking(Files.createTempFile("mugge-", ".part"))
+                  _ <- Sync[F].blocking(Files.write(tmp, bytes, StandardOpenOption.APPEND))
                   _ <- state.update(st =>
                     st.copy(incomingFiles =
                       st.incomingFiles.updatedWith(id)(_.map(_.copy(temp = Some(tmp))))
@@ -210,44 +239,44 @@ object FileTransfer:
                   ui.printLine(s"Receiving ${inc.name} from ${inc.from}... $pct%")
                 })
         }
-      case _ => IO.unit
+      case _ => ().pure[F]
 
-  def end(msg: String, state: Ref[IO, ClientState], ui: Ui): IO[Unit] =
+  override def end(msg: String, state: Ref[F, ClientState[F]], ui: Ui[F]): F[Unit] =
     msg.split(":", 3) match
       case Array(_, id, sha) =>
         state
           .modify(st => (st.copy(incomingFiles = st.incomingFiles - id), st.incomingFiles.get(id)))
           .flatMap {
-            case None => IO.unit
+            case None => ().pure[F]
             case Some(incoming) =>
               for
                 tmp <- incoming.temp match
-                  case Some(t) => IO.pure(t)
-                  case None    => IO.blocking(Files.createTempFile("mugge-", ".part"))
+                  case Some(t) => t.pure[F]
+                  case None    => Sync[F].blocking(Files.createTempFile("mugge-", ".part"))
                 _ <- finalizeIncoming(tmp, sha, incoming, ui)
               yield ()
           }
-      case _ => IO.unit
+      case _ => ().pure[F]
 
   private def finalizeIncoming(
       tmp: Path,
       expectedSha: String,
       incoming: IncomingFile,
-      ui: Ui
-  ): IO[Unit] =
+      ui: Ui[F]
+  ): F[Unit] =
     allow[FileError] {
       streamSha256(tmp).flatMap { actualSha =>
         if !actualSha.equalsIgnoreCase(expectedSha) then
-          IO.blocking(Files.deleteIfExists(tmp)).attempt.void *>
+          Sync[F].blocking(Files.deleteIfExists(tmp)).attempt.void *>
             raiseFile(FileError.ChecksumMismatch(incoming.name))
         else
           for
             dir <- downloadDir
-            _ <- IO.blocking(Files.createDirectories(dir))
-            target <- IO.blocking(uniqueTarget(dir, incoming.name))
-            _ <- IO.blocking(Files.move(tmp, target))
+            _ <- Sync[F].blocking(Files.createDirectories(dir))
+            target <- Sync[F].blocking(uniqueTarget(dir, incoming.name))
+            _ <- Sync[F].blocking(Files.move(tmp, target))
             _ <- ui.printLine(s"Saved ${incoming.name} from ${incoming.from} to $target")
-            _ <- Notifications.send(
+            _ <- notifications.send(
               title = s"📎 File received from ${incoming.from}",
               body = s"Saved to $target",
               urgency = "normal"
@@ -259,12 +288,12 @@ object FileTransfer:
   private def toHex(bytes: Array[Byte]): String =
     bytes.map(b => f"${b & 0xff}%02x").mkString
 
-  private def streamSha256(path: Path): IO[String] =
-    IO(MessageDigest.getInstance("SHA-256")).flatMap { md =>
-      Fs2Files[IO]
+  private def streamSha256(path: Path): F[String] =
+    Sync[F].delay(MessageDigest.getInstance("SHA-256")).flatMap { md =>
+      Fs2Files[F]
         .readAll(Fs2Path.fromNioPath(path))
         .chunks
-        .evalMap(c => IO(md.update(c.toArray)))
+        .evalMap(c => Sync[F].delay(md.update(c.toArray)))
         .compile
         .drain
         .map(_ => toHex(md.digest()))
@@ -275,8 +304,8 @@ object FileTransfer:
     val cleaned = base.trim
     if cleaned.isEmpty || cleaned == "." || cleaned == ".." then "file" else cleaned
 
-  private def downloadDir: IO[Path] =
-    IO {
+  private def downloadDir: F[Path] =
+    Sync[F].delay {
       sys.env
         .get("XDG_DOWNLOAD_DIR")
         .filter(_.nonEmpty)
@@ -296,3 +325,8 @@ object FileTransfer:
         .map(i => dir.resolve(s"$base ($i)$ext"))
         .find(p => !Files.exists(p))
         .getOrElse(initial)
+
+object LiveFileTransfer:
+  def apply[F[_]: Async: Fs2Files: UUIDGen](
+      notifications: Notifications[F]
+  ): FileTransfer[F] = new LiveFileTransfer[F](notifications)

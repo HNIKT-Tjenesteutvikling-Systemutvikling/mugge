@@ -3,10 +3,7 @@ package chat
 import cats.effect.*
 import cats.mtl.Raise
 import cats.syntax.all.*
-import org.typelevel.log4cats.Logger as TLogger
 import org.typelevel.log4cats.LoggerFactory
-import org.typelevel.log4cats.slf4j.Slf4jFactory
-import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 import java.nio.ByteBuffer
 import java.nio.file.Files
@@ -16,10 +13,18 @@ import java.security.spec.*
 import java.util.Base64
 import scala.sys.process.*
 
-object Authentication:
-  given LoggerFactory[IO] = Slf4jFactory.create[IO]
-  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
+trait Authentication[F[_]]:
+  def loadPrivateKey(keyPath: String = s"${System.getProperty("user.home")}/.ssh/id_rsa")(using
+      Raise[F, Authentication.AuthError]
+  ): F[PrivateKey]
 
+  def signChallenge(challenge: String, privateKey: PrivateKey)(using
+      Raise[F, Authentication.AuthError]
+  ): F[String]
+
+  def detectGithubUsername()(using Raise[F, Authentication.AuthError]): F[Option[String]]
+
+object Authentication:
   sealed trait AuthError extends Exception:
     def message: String
     override def getMessage: String = message
@@ -52,14 +57,21 @@ object Authentication:
 
   case class AuthChallenge(challenge: String, signature: Option[String])
 
-  private def raiseFromEither[A](e: Either[AuthError, A])(using r: Raise[IO, AuthError]): IO[A] =
-    e.fold(r.raise, IO.pure)
+final class LiveAuthentication[F[_]: Sync: LoggerFactory] private () extends Authentication[F]:
+  import Authentication.*
 
-  def loadPrivateKey(
+  private val logger = LoggerFactory[F].getLogger
+
+  private def raiseFromEither[A](e: Either[AuthError, A])(using r: Raise[F, AuthError]): F[A] =
+    e match
+      case Left(err) => r.raise(err)
+      case Right(a)  => a.pure[F]
+
+  override def loadPrivateKey(
       keyPath: String = s"${System.getProperty("user.home")}/.ssh/id_rsa"
-  )(using Raise[IO, AuthError]): IO[PrivateKey] =
+  )(using Raise[F, AuthError]): F[PrivateKey] =
     for
-      home <- IO(System.getProperty("user.home"))
+      home <- Sync[F].delay(System.getProperty("user.home"))
       keyPaths = List(
         keyPath,
         s"$home/.config/sops-nix/secrets/private_keys/gako",
@@ -67,7 +79,7 @@ object Authentication:
         s"$home/.ssh/id_ed25519",
         s"$home/.ssh/id_ecdsa"
       )
-      found <- IO.blocking(keyPaths.find(path => Files.exists(Paths.get(path))))
+      found <- Sync[F].blocking(keyPaths.find(path => Files.exists(Paths.get(path))))
       path <- found match
         case Some(p) => logger.debug(s"Found key at: $p").as(p)
         case None =>
@@ -78,19 +90,19 @@ object Authentication:
               )
             )
           )
-      keyString <- IO.blocking {
+      keyString <- Sync[F].blocking {
         Either
           .catchNonFatal(new String(Files.readAllBytes(Paths.get(path))))
           .leftMap(e => KeyLoadError(s"Failed to read key file: ${e.getMessage}"))
       }
       _ <- logger.debug(s"Reading key from: $path")
-      actualPath <- IO.blocking(Either.catchNonFatal(Paths.get(path).toRealPath()))
+      actualPath <- Sync[F].blocking(Either.catchNonFatal(Paths.get(path).toRealPath()))
       _ <- actualPath match
         case Right(ap) if ap.toString != path => logger.debug(s"Key is symlinked to: $ap")
-        case _                                => IO.unit
+        case _                                => ().pure[F]
       _ <- keyString match
         case Right(str) => logger.debug(s"Key format detected: ${detectKeyFormat(str)}")
-        case _          => IO.unit
+        case _          => ().pure[F]
       str <- raiseFromEither(keyString)
       pk <- parsePrivateKey(path, str)
     yield pk
@@ -103,12 +115,12 @@ object Authentication:
     else "Unknown"
 
   private def parsePrivateKey(path: String, keyString: String)(using
-      Raise[IO, AuthError]
-  ): IO[PrivateKey] =
+      Raise[F, AuthError]
+  ): F[PrivateKey] =
     if keyString.contains("BEGIN OPENSSH PRIVATE KEY") then parseOpenSSHKey(keyString)
     else if keyString.contains("BEGIN RSA PRIVATE KEY") then parsePKCS1Key(keyString)
     else if keyString.contains("BEGIN PRIVATE KEY") then
-      IO.blocking(parsePKCS8Key(keyString)).flatMap(raiseFromEither)
+      Sync[F].blocking(parsePKCS8Key(keyString)).flatMap(raiseFromEither)
     else if keyString.contains("BEGIN EC PRIVATE KEY") then
       raiseFromEither(
         Left(KeyLoadError("EC keys are not supported. Please use an RSA or ed25519 key."))
@@ -134,8 +146,8 @@ object Authentication:
     Array(0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
       0x20).map(_.toByte)
 
-  private def parseOpenSSHKey(keyString: String)(using Raise[IO, AuthError]): IO[PrivateKey] =
-    IO.blocking(decodeOpenSSHEd25519Seed(keyString)).flatMap(raiseFromEither).flatMap {
+  private def parseOpenSSHKey(keyString: String)(using Raise[F, AuthError]): F[PrivateKey] =
+    Sync[F].blocking(decodeOpenSSHEd25519Seed(keyString)).flatMap(raiseFromEither).flatMap {
       case Some(seed) => raiseFromEither(ed25519PrivateFromSeed(seed))
       case None       => convertOpenSSHKey(keyString)
     }
@@ -194,8 +206,8 @@ object Authentication:
       }
       .leftMap(e => KeyParseError(s"Failed to build Ed25519 private key: ${e.getMessage}"))
 
-  private def convertOpenSSHKey(keyString: String)(using Raise[IO, AuthError]): IO[PrivateKey] =
-    IO.blocking(convertOpenSSHKeySync(keyString)).flatMap(raiseFromEither)
+  private def convertOpenSSHKey(keyString: String)(using Raise[F, AuthError]): F[PrivateKey] =
+    Sync[F].blocking(convertOpenSSHKeySync(keyString)).flatMap(raiseFromEither)
 
   private def convertOpenSSHKeySync(keyString: String): Either[AuthError, PrivateKey] =
     Either
@@ -240,8 +252,8 @@ object Authentication:
       .leftMap(e => KeyConversionError(s"Failed to convert OpenSSH key: ${e.getMessage}"))
       .flatten
 
-  private def parsePKCS1Key(keyString: String)(using Raise[IO, AuthError]): IO[PrivateKey] =
-    IO.blocking(parsePKCS1KeySync(keyString)).flatMap(raiseFromEither)
+  private def parsePKCS1Key(keyString: String)(using Raise[F, AuthError]): F[PrivateKey] =
+    Sync[F].blocking(parsePKCS1KeySync(keyString)).flatMap(raiseFromEither)
 
   private def parsePKCS1KeySync(keyString: String): Either[AuthError, PrivateKey] =
     Either
@@ -269,38 +281,45 @@ object Authentication:
       .leftMap(e => KeyConversionError(s"Failed to convert PKCS1 key: ${e.getMessage}"))
       .flatten
 
-  def signChallenge(challenge: String, privateKey: PrivateKey)(using
-      Raise[IO, AuthError]
-  ): IO[String] =
-    IO.blocking {
-      Either
-        .catchNonFatal {
-          val algorithm = privateKey match
-            case _: java.security.interfaces.EdECPrivateKey => "Ed25519"
-            case _                                          => "SHA256withRSA"
-          val signature = Signature.getInstance(algorithm)
-          signature.initSign(privateKey)
-          signature.update(challenge.getBytes("UTF-8"))
-          val signatureBytes = signature.sign()
-          Base64.getEncoder.encodeToString(signatureBytes)
-        }
-        .leftMap(e => SignatureError(s"Failed to sign challenge: ${e.getMessage}"))
-    }.flatMap(raiseFromEither)
+  override def signChallenge(challenge: String, privateKey: PrivateKey)(using
+      Raise[F, AuthError]
+  ): F[String] =
+    Sync[F]
+      .blocking {
+        Either
+          .catchNonFatal {
+            val algorithm = privateKey match
+              case _: java.security.interfaces.EdECPrivateKey => "Ed25519"
+              case _                                          => "SHA256withRSA"
+            val signature = Signature.getInstance(algorithm)
+            signature.initSign(privateKey)
+            signature.update(challenge.getBytes("UTF-8"))
+            val signatureBytes = signature.sign()
+            Base64.getEncoder.encodeToString(signatureBytes)
+          }
+          .leftMap(e => SignatureError(s"Failed to sign challenge: ${e.getMessage}"))
+      }
+      .flatMap(raiseFromEither)
 
-  def detectGithubUsername()(using Raise[IO, AuthError]): IO[Option[String]] =
-    IO.blocking {
-      Either
-        .catchNonFatal {
-          Process(Seq("git", "config", "--global", "user.name")).!!.trim
-        }
-        .leftMap(e => GitConfigError(s"Failed to read git config: ${e.getMessage}"))
-        .map { gitConfig =>
-          val username = gitConfig.toLowerCase match
-            case "merrinx" => "Gako358"
-            case "gako358" => "Gako358"
-            case _         => gitConfig
-          AuthorizedUser.values
-            .find(_.githubUsername.equalsIgnoreCase(username))
-            .map(_.githubUsername)
-        }
-    }.flatMap(raiseFromEither)
+  override def detectGithubUsername()(using Raise[F, AuthError]): F[Option[String]] =
+    Sync[F]
+      .blocking {
+        Either
+          .catchNonFatal {
+            Process(Seq("git", "config", "--global", "user.name")).!!.trim
+          }
+          .leftMap(e => GitConfigError(s"Failed to read git config: ${e.getMessage}"))
+          .map { gitConfig =>
+            val username = gitConfig.toLowerCase match
+              case "merrinx" => "Gako358"
+              case "gako358" => "Gako358"
+              case _         => gitConfig
+            AuthorizedUser.values
+              .find(_.githubUsername.equalsIgnoreCase(username))
+              .map(_.githubUsername)
+          }
+      }
+      .flatMap(raiseFromEither)
+
+object LiveAuthentication:
+  def apply[F[_]: Sync: LoggerFactory](): Authentication[F] = new LiveAuthentication[F]()

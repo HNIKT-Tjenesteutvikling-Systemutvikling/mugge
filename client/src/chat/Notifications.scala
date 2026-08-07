@@ -1,10 +1,11 @@
 package chat
 
+import cats.Applicative
 import cats.effect.*
+import cats.effect.syntax.all.*
 import cats.mtl.Handle.allow
 import cats.syntax.all.*
-import org.typelevel.log4cats.Logger as TLogger
-import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.LoggerFactory
 
 import scala.concurrent.duration.*
 import scala.sys.process.*
@@ -12,82 +13,64 @@ import scala.sys.process.*
 import Ansi.*
 
 /** Desktop notifications: mentions, rate-limited `!ping` bursts and reminders. */
-object Notifications:
-  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
+trait Notifications[F[_]]:
+  def mentions(line: String, myUsername: String): F[Unit]
+  def nudge(msg: String, state: Ref[F, ClientState[F]]): F[Unit]
+  def send(title: String, body: String, urgency: String, timeout: Int = 5000): F[Unit]
+  def reminder(msg: String, myUsername: String, ui: Ui[F]): F[Unit]
+
+final class LiveNotifications[F[_]: Async: LoggerFactory] private (
+    audio: Audio[F]
+) extends Notifications[F]:
+  private val logger = LoggerFactory[F].getLogger
 
   private val maxPingsPerWindow = 3
   private val pingWindow = 5.minutes
 
-  def mentions(line: String, myUsername: String): IO[Unit] =
+  override def mentions(line: String, myUsername: String): F[Unit] =
     val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
-    val mentionPattern = s"@(\\w+)".r
+    // Unicode-aware so that "@Bjørn" is one mention, not "@Bj".
+    val mentionPattern = """@([\p{L}\p{M}\p{N}_-]+)""".r
 
     line match
-      case messagePattern(time, sender, content) =>
-        if !content.startsWith("!ping") then
-          val mentions = mentionPattern.findAllMatchIn(content).map(_.group(1)).toSet
-
-          if mentions.exists(_.equalsIgnoreCase(myUsername)) then
-            send(
-              title = s"Chat: $sender mentioned you",
-              body = content,
-              urgency = "normal"
-            )
-          else IO.unit
-        else IO.unit
+      case messagePattern(_, sender, content) =>
+        val mentions = mentionPattern.findAllMatchIn(content).map(_.group(1)).toSet
+        if mentions.exists(_.equalsIgnoreCase(myUsername)) then
+          send(
+            title = s"Chat: $sender mentioned you",
+            body = content,
+            urgency = "normal"
+          )
+        else Applicative[F].unit
       case _ =>
-        IO.unit
+        Applicative[F].unit
 
-  def pings(
-      line: String,
-      myUsername: String,
-      state: Ref[IO, ClientState]
-  ): IO[Unit] =
-    val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
-    val pingPattern = """^!ping\s+@(\w+)(?:\s+(\d+))?""".r
-
-    line match
-      case messagePattern(time, sender, content) =>
-        content match
-          case pingPattern(targetUser, countStr) if targetUser.equalsIgnoreCase(myUsername) =>
-            val requested = Option(countStr).flatMap(_.toIntOption).getOrElse(1).max(1)
-            IO.monotonic.flatMap { now =>
-              state
-                .modify { st =>
-                  val recent = st.pingHistory
-                    .getOrElse(sender, Nil)
-                    .filter(t => now - t < pingWindow)
-                  val allowed = (maxPingsPerWindow - recent.size).max(0).min(requested)
-                  val updated = recent ++ List.fill(allowed)(now)
-                  (st.copy(pingHistory = st.pingHistory.updated(sender, updated)), allowed)
-                }
-                .flatMap { allowed =>
-                  if allowed <= 0 then IO.unit
-                  else sendMultiplePings(sender, time, allowed)
-                }
+  override def nudge(msg: String, state: Ref[F, ClientState[F]]): F[Unit] =
+    msg.split(":", 3) match
+      case Array(_, sender, countStr) =>
+        val requested = countStr.trim.toIntOption.getOrElse(1).max(1)
+        Clock[F].monotonic.flatMap { now =>
+          state
+            .modify { st =>
+              val recent = st.pingHistory
+                .getOrElse(sender, Nil)
+                .filter(t => now - t < pingWindow)
+              val allowed = (maxPingsPerWindow - recent.size).max(0).min(requested)
+              val updated = recent ++ List.fill(allowed)(now)
+              (st.copy(pingHistory = st.pingHistory.updated(sender, updated)), allowed)
             }
-          case _ => IO.unit
-      case _ =>
-        IO.unit
+            .flatMap { allowed =>
+              if allowed <= 0 then Applicative[F].unit else sendMultiplePings(sender, allowed)
+            }
+        }
+      case _ => Applicative[F].unit
 
-  private def sendMultiplePings(sender: String, time: String, count: Int): IO[Unit] =
-    val delay = 500.milliseconds
-
-    (1 to count).toList.traverse_ { i =>
-      send(
-        title = s"🔔 Mention from $sender (${i}/$count)",
-        body = s"$sender mentioned you at $time",
-        urgency = "critical",
-        timeout = 0
-      ) >> IO.sleep(delay)
-    }
-
-  def send(
+  override def send(
       title: String,
       body: String,
       urgency: String,
       timeout: Int = 5000
-  ): IO[Unit] = {
+  ): F[Unit] = {
     val command = Seq(
       "notify-send",
       "-u",
@@ -102,18 +85,13 @@ object Notifications:
       body
     )
 
-    IO.blocking(command.!).void.handleErrorWith { e =>
+    Sync[F].blocking(command.!).void.handleErrorWith { e =>
       logger.error(s"[Notification Error] ${e.getMessage}") *>
         logger.info(s"[Notification] $title: $body")
     } <* playNotificationSound(urgency == "critical").start.void
   }
 
-  private def playNotificationSound(critical: Boolean): IO[Unit] =
-    allow[Audio.AudioError] {
-      Audio.playTone(critical)
-    }.rescue(err => logger.warn(s"[Notification Sound] ${err.message}"))
-
-  def reminder(msg: String, myUsername: String, ui: Ui): IO[Unit] =
+  override def reminder(msg: String, myUsername: String, ui: Ui[F]): F[Unit] =
     msg.split(":", 5) match
       case Array(_, from, hh, mm, text) =>
         val fromSelf = from.equalsIgnoreCase(myUsername)
@@ -123,4 +101,25 @@ object Notifications:
           else s"$serverColor⏰ Reminder from $from (set for $hh:$mm): $text$ansiReset"
         ui.printLine(line) *>
           send(title, text, urgency = "critical", timeout = 0)
-      case _ => IO.unit
+      case _ => Applicative[F].unit
+
+  private def sendMultiplePings(sender: String, count: Int): F[Unit] =
+    val delay = 500.milliseconds
+
+    (1 to count).toList.traverse_ { i =>
+      send(
+        title = s"🔔 Ping from $sender (${i}/$count)",
+        body = s"$sender pinged you",
+        urgency = "critical",
+        timeout = 0
+      ) >> Temporal[F].sleep(delay)
+    }
+
+  private def playNotificationSound(critical: Boolean): F[Unit] =
+    allow[AudioError] {
+      audio.playTone(critical)
+    }.rescue(err => logger.warn(s"[Notification Sound] ${err.message}"))
+
+object LiveNotifications:
+  def apply[F[_]: Async: LoggerFactory](audio: Audio[F]): Notifications[F] =
+    new LiveNotifications[F](audio)

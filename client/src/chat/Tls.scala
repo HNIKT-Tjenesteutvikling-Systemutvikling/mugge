@@ -1,6 +1,7 @@
 package chat
 
 import cats.effect.*
+import cats.syntax.all.*
 import fs2.io.net.Network
 import fs2.io.net.tls.TLSContext
 import fs2.io.net.tls.TLSParameters
@@ -12,6 +13,9 @@ import java.security.cert.X509Certificate
 import java.util.Base64
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
+
+trait Tls[F[_]]:
+  def pinnedContext: F[TLSContext[F]]
 
 object Tls:
   // Base64 SHA-256 of the server's SubjectPublicKeyInfo, pinned like the
@@ -40,7 +44,7 @@ object Tls:
       MessageDigest.getInstance("SHA-256").digest(cert.getPublicKey.getEncoded)
     )
 
-  private val pinningTrustManager: X509TrustManager =
+  private[chat] val pinningTrustManager: X509TrustManager =
     new X509TrustManager:
       def checkClientTrusted(chain: Array[X509Certificate], authType: String): Unit = ()
       def checkServerTrusted(chain: Array[X509Certificate], authType: String): Unit =
@@ -49,19 +53,25 @@ object Tls:
           throw new CertificateException(new PinMismatch(fp)) // scalafix:ok DisableSyntax.throw
       def getAcceptedIssuers: Array[X509Certificate] = Array.empty
 
-  def pinnedContext: IO[TLSContext[IO]] =
-    IO.blocking {
-      val ctx = SSLContext.getInstance("TLS")
-      ctx.init(
-        null, // scalafix:ok DisableSyntax.null
-        Array(pinningTrustManager),
-        new SecureRandom()
-      )
-      ctx
-    }.map(Network[IO].tlsContext.fromSSLContext)
-
   def isPinMismatch(err: Throwable): Boolean =
     Option(err) match
       case Some(_: PinMismatch) => true
       case Some(e)              => isPinMismatch(e.getCause)
       case None                 => false
+
+final class LiveTls[F[_]: Async: Network] private () extends Tls[F]:
+  override def pinnedContext: F[TLSContext[F]] =
+    Sync[F]
+      .blocking {
+        val ctx = SSLContext.getInstance("TLS")
+        ctx.init(
+          null, // scalafix:ok DisableSyntax.null
+          Array(Tls.pinningTrustManager),
+          new SecureRandom()
+        )
+        ctx
+      }
+      .map(Network[F].tlsContext.fromSSLContext)
+
+object LiveTls:
+  def apply[F[_]: Async: Network](): Tls[F] = new LiveTls[F]()

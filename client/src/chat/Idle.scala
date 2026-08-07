@@ -3,27 +3,28 @@ package chat
 import cats.effect.*
 import cats.mtl.Handle.allow
 import cats.mtl.Raise
+import cats.syntax.all.*
 import fs2.Stream
-import fs2.io.file.Files as Fs2Files
-import fs2.io.file.Path as Fs2Path
+import fs2.io.file.Files
+import fs2.io.file.Path
 import fs2.io.process.ProcessBuilder
+import fs2.io.process.Processes
 import fs2.text
-import org.typelevel.log4cats.Logger as TLogger
 import org.typelevel.log4cats.LoggerFactory
-import org.typelevel.log4cats.slf4j.Slf4jFactory
-import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 import scala.concurrent.duration.*
 import scala.sys.process.*
 
-object Idle:
-  given LoggerFactory[IO] = Slf4jFactory.create[IO]
-  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
+final case class IdleError(message: String)
 
-  final case class IdleError(message: String)
+trait Idle[F[_]]:
+  /** Whole-desktop input idleness: `true` when the user went idle, `false` when a key or the mouse
+    * brought them back.
+    */
+  def transitions(after: FiniteDuration): Stream[F, Boolean]
 
-  private def orRaise[A](io: IO[A])(using r: Raise[IO, IdleError]): IO[A] =
-    io.handleErrorWith(e => r.raise(IdleError(Option(e.getMessage).getOrElse(e.toString))))
+final class LiveIdle[F[_]: Async: Files: Processes: LoggerFactory] private () extends Idle[F]:
+  private val logger = LoggerFactory[F].getLogger
 
   private val pollInterval = 15.seconds
   private val reprobeInterval = 1.minute
@@ -42,11 +43,8 @@ object Idle:
     "org.gnome.Mutter.IdleMonitor.GetIdletime"
   )
 
-  /** Whole-desktop input idleness: `true` when the user went idle, `false` when a key or the mouse
-    * brought them back.
-    */
-  def transitions(after: FiniteDuration): Stream[IO, Boolean] =
-    val resolve: IO[Stream[IO, Boolean]] =
+  override def transitions(after: FiniteDuration): Stream[F, Boolean] =
+    val resolve: F[Stream[F, Boolean]] =
       allow[IdleError](backend(after)).rescue { err =>
         logger.debug(s"No idle backend available: ${err.message}").as(Stream.empty)
       }
@@ -56,22 +54,25 @@ object Idle:
     val attempt = Stream.eval(resolve).flatten.handleErrorWith { err =>
       Stream.exec(logger.debug(s"Idle backend stopped: ${err.getMessage}"))
     }
-    (attempt ++ Stream.sleep_[IO](reprobeInterval)).repeat
+    (attempt ++ Stream.sleep_[F](reprobeInterval)).repeat
+
+  private def orRaise[A](fa: F[A])(using r: Raise[F, IdleError]): F[A] =
+    fa.handleErrorWith(e => r.raise(IdleError(Option(e.getMessage).getOrElse(e.toString))))
 
   private def backend(after: FiniteDuration)(using
-      Raise[IO, IdleError]
-  ): IO[Stream[IO, Boolean]] =
+      Raise[F, IdleError]
+  ): F[Stream[F, Boolean]] =
     mutterIdleMillis.flatMap {
-      case Some(_) => IO.pure(mutterTransitions(after))
+      case Some(_) => mutterTransitions(after).pure[F]
       case None    => swayidleTransitions(after)
     }
 
   // Mutter reports idle time but offers no event to await, so GNOME is polled;
   // every other compositor is subscribed to through swayidle.
-  private def mutterTransitions(after: FiniteDuration): Stream[IO, Boolean] =
-    Stream.eval(Ref.of[IO, Boolean](false)).flatMap { wasIdle =>
+  private def mutterTransitions(after: FiniteDuration): Stream[F, Boolean] =
+    Stream.eval(Ref.of[F, Boolean](false)).flatMap { wasIdle =>
       Stream
-        .awakeEvery[IO](pollInterval)
+        .awakeEvery[F](pollInterval)
         .evalMap(_ => mutterIdleMillis)
         .unNone
         .evalMapFilter { millis =>
@@ -80,19 +81,21 @@ object Idle:
         }
     }
 
-  private def mutterIdleMillis: IO[Option[Long]] =
-    IO.blocking {
-      val quiet = ProcessLogger(_ => (), _ => ())
-      Process(mutterCall).!!(quiet)
-    }.attempt
+  private def mutterIdleMillis: F[Option[Long]] =
+    Sync[F]
+      .blocking {
+        val quiet = ProcessLogger(_ => (), _ => ())
+        Process(mutterCall).!!(quiet)
+      }
+      .attempt
       .map(_.toOption.flatMap {
         case mutterIdlePattern(millis) => millis.toLongOption
         case _                         => None
       })
 
   private def swayidleTransitions(after: FiniteDuration)(using
-      Raise[IO, IdleError]
-  ): IO[Stream[IO, Boolean]] =
+      Raise[F, IdleError]
+  ): F[Stream[F, Boolean]] =
     waylandEnv.flatMap { env =>
       orRaise(
         ProcessBuilder(
@@ -103,7 +106,7 @@ object Idle:
           "echo idle",
           "resume",
           "echo active"
-        ).withExtraEnv(env).spawn[IO].allocated
+        ).withExtraEnv(env).spawn[F].allocated
       ).map { case (process, release) =>
         process.stdout
           .through(text.utf8.decode)
@@ -122,17 +125,20 @@ object Idle:
 
   // The unit's environment snapshot predates the graphical session, so
   // WAYLAND_DISPLAY is usually missing: resolve the socket from the runtime dir.
-  private def waylandEnv: IO[Map[String, String]] =
-    if sys.env.contains("WAYLAND_DISPLAY") then IO.pure(Map.empty)
+  private def waylandEnv: F[Map[String, String]] =
+    if sys.env.contains("WAYLAND_DISPLAY") then Map.empty[String, String].pure[F]
     else
       sys.env.get("XDG_RUNTIME_DIR") match
-        case None => IO.pure(Map.empty)
+        case None => Map.empty[String, String].pure[F]
         case Some(dir) =>
-          Fs2Files[IO]
-            .list(Fs2Path(dir))
+          Files[F]
+            .list(Path(dir))
             .map(_.fileName.toString)
             .filter(name => name.startsWith("wayland-") && !name.endsWith(".lock"))
             .compile
             .toList
             .map(_.sorted.headOption.fold(Map.empty)(d => Map("WAYLAND_DISPLAY" -> d)))
             .handleError(_ => Map.empty)
+
+object LiveIdle:
+  def apply[F[_]: Async: Files: Processes: LoggerFactory](): Idle[F] = new LiveIdle[F]()

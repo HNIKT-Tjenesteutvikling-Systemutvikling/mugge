@@ -1,7 +1,10 @@
 package chat
 
-object UserMapping:
-  def mapHostname(hostname: String): String =
+trait UserMapping:
+  def mapHostname(hostname: String): String
+
+final class LiveUserMapping private () extends UserMapping:
+  override def mapHostname(hostname: String): String =
     hostname match
       case "terangreal"     => "Knut"
       case "tuathaan"       => "Gako"
@@ -17,3 +20,6 @@ object UserMapping:
       case "shitbox"        => "Leif"
       case "ketil"          => "Ketil"
       case other            => other
+
+object LiveUserMapping:
+  def apply(): UserMapping = new LiveUserMapping()

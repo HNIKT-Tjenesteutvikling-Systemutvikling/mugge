@@ -61,3 +61,106 @@ runtime, so *no JDK or nix is required* on the target machine — any
   =MUGGE_INSECURE_TLS=1=) to skip pinning — it prints a warning and must
   not be used in production.
 - *Voice* needs PipeWire/ALSA on the host; text chat works regardless.
+
+* Guix
+
+Guix cannot compile the Scala sources — sbt/coursier are not packaged and
+derivations have no network access — so the Guix package repacks the jars
+from the release tarball and runs them on Guix's own =openjdk=. The
+tarball's bundled Temurin runtime and its jpackage launcher are dropped:
+they are generic-glibc binaries that do not run on Guix System.
+
+** Add the channel
+
+=~/.config/guix/channels.scm=:
+#+begin_src scheme
+  (cons* (channel
+          (name 'mugge)
+          (url "https://github.com/HNIKT-Tjenesteutvikling-Systemutvikling/mugge")
+          (branch "master"))
+         %default-channels)
+#+end_src
+
+then =guix pull=. The channel carries no OpenPGP introduction, so =guix
+pull= warns that it cannot authenticate it. From a checkout the package
+builds without the channel: =guix build -f guix.scm=.
+
+** Run it by hand
+
+#+begin_src shell
+  guix install mugge-client
+  mugge-azure                  # hosted Azure server, defaults baked in
+  mugge-client <host> <port>   # raw launcher, no defaults
+#+end_src
+
+** Always-on client as a Shepherd service (Guix Home)
+
+The Guix Home counterpart of =nix/hm-module.nix=: the client runs inside a
+=dtach= session supervised by Shepherd, and =mugge= attaches a terminal to
+it. In =~/.config/guix/home/config.scm=:
+
+#+begin_src scheme
+  (use-modules (mugge home))
+
+  (home-environment
+   (services
+    (list (service home-mugge-chat-service-type))))
+#+end_src
+
+After =guix home reconfigure=:
+
+| =herd status mugge-chat= | is the background client connected? |
+| =mugge=                  | attach a terminal to it             |
+| =Ctrl-\=                 | detach — the chat stays connected   |
+| =herd stop mugge-chat=   | stop the background client          |
+
+All fields of =home-mugge-chat-configuration= have defaults: =package=,
+=attach=, =command= (="mugge-azure"=), =socket-path=
+(=$XDG_RUNTIME_DIR/mugge.sock=), =log-file= (=$XDG_RUNTIME_DIR/mugge-chat.log=)
+and =auto-start?=.
+
+** Notes
+
+- Same tradeoffs as the systemd unit: the background session runs in
+  plain-line mode (no side panel, the dtach pty has no size until an
+  attach), and dtach allows one attach at a time.
+- Shepherd respawns the service on *any* exit, where systemd only
+  restarts on failure. Under the service =/quit= is disabled, so this only
+  differs if the JVM itself dies.
+- The launcher puts =openssh=, =openssl=, =git=, =libnotify=, =util-linux=,
+  =glib:bin=, =swayidle= and =pipewire= on =PATH=, so auth, notifications,
+  the =--assist= bridge, idle detection and voice all work; each one
+  soft-fails if unused.
+- The package pins a release tarball. After tagging =vX.Y.Z=, update
+  =%mugge-version= and the =sha256= in =guix/mugge/packages.scm= with
+  #+begin_src shell
+    guix download https://github.com/HNIKT-Tjenesteutvikling-Systemutvikling/mugge/releases/download/vX.Y.Z/mugge-linux-x64.tar.gz
+  #+end_src
+
+* Companion socket (frontends)
+
+The running client exposes a local Unix socket so editors can render the
+chat themselves instead of attaching a terminal — this is what the VS Code
+sidebar uses. Frontends *must* go through it: the server displaces an older
+session when the same user reconnects, so a second client would fight the
+always-on one.
+
+- Path: =$XDG_RUNTIME_DIR/mugge-ipc.sock= (=MUGGE_IPC_SOCKET= overrides,
+  =MUGGE_NO_IPC=1= disables it).
+- *Out*: one JSON object per line.
+  #+begin_src js
+    {"type":"hello","protocol":1,"me":"Knut","users":["Knut"],"typing":[],"connected":true}
+    {"type":"message","time":"19:02:20","sender":"Knut","verified":true,"text":"hei","history":false}
+    {"type":"message", ... ,"code":true,"lang":"scala","text":"def f = 1"}
+    {"type":"whisper","time":"19:03:01","incoming":true,"peer":"Leif","text":"psst"}
+    {"type":"notice","text":"Type /help to list available commands."}
+    {"type":"users","users":["Knut","Leif"]}
+    {"type":"typing","users":["Leif"]}
+    {"type":"me","name":"Bjørnar"}
+    {"type":"connection","connected":false}
+  #+end_src
+  Every new subscriber first gets =hello= followed by a replay of the
+  recent chat, so a frontend opened mid-session is not empty.
+- *In*: plain text lines, handled exactly as if typed at the prompt —
+  including =/commands=, =:emoji:= and code fences.
+- Voice, file transfer, assist consent and reminders stay terminal-only.

@@ -2,6 +2,9 @@ package chat
 
 import scala.util.matching.Regex
 
+trait Emoji:
+  def expand(line: String): String
+
 object Emoji:
   val shortcodes: Map[String, String] = Map(
     "smile" -> "😄",
@@ -77,21 +80,25 @@ object Emoji:
     "8)" -> "😎"
   )
 
-  private val pattern: Regex = """:([a-zA-Z0-9_+-]+):""".r
+  private[chat] val pattern: Regex = """:([a-zA-Z0-9_+-]+):""".r
 
-  private val emoticonPattern: Regex =
+  private[chat] val emoticonPattern: Regex =
     emoticons.keys.toList
       .sortBy(-_.length)
       .map(Regex.quote)
       .mkString("""(?<=^|\s)(""", "|", """)(?=\s|$)""")
       .r
 
-  def expand(line: String): String =
-    val withShortcodes = pattern.replaceAllIn(
+final class LiveEmoji private () extends Emoji:
+  override def expand(line: String): String =
+    val withShortcodes = Emoji.pattern.replaceAllIn(
       line,
-      m => Regex.quoteReplacement(shortcodes.getOrElse(m.group(1), m.matched))
+      m => Regex.quoteReplacement(Emoji.shortcodes.getOrElse(m.group(1), m.matched))
     )
-    emoticonPattern.replaceAllIn(
+    Emoji.emoticonPattern.replaceAllIn(
       withShortcodes,
-      m => Regex.quoteReplacement(emoticons(m.group(1)))
+      m => Regex.quoteReplacement(Emoji.emoticons(m.group(1)))
     )
+
+object LiveEmoji:
+  def apply(): Emoji = new LiveEmoji()

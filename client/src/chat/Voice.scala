@@ -2,45 +2,69 @@ package chat
 
 import cats.effect.*
 import cats.effect.std.Queue
+import cats.effect.syntax.all.*
 import cats.mtl.Handle.allow
+import cats.syntax.all.*
 
-final case class Voice(handle: Audio.Handle, teardown: IO[Unit])
+final case class VoiceSession[F[_]](handle: AudioHandle[F], teardown: F[Unit])
 
-object Voice:
+trait Voice[F[_]]:
   def toggle(
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui,
-      voiceRef: Ref[IO, Option[Voice]]
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit]
+
+  def toggleTest(
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit]
+
+  def toggleMute(
+      state: Ref[F, ClientState[F]],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit]
+
+final class LiveVoice[F[_]: Concurrent] private (audio: Audio[F]) extends Voice[F]:
+
+  override def toggle(
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit] =
     voiceRef.get.flatMap {
       case Some(_) => stop(state, outgoingQueue, ui, voiceRef)
       case None    => start(state, outgoingQueue, ui, voiceRef, loopback = false)
     }
 
-  def toggleTest(
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui,
-      voiceRef: Ref[IO, Option[Voice]]
-  ): IO[Unit] =
+  override def toggleTest(
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit] =
     voiceRef.get.flatMap {
       case Some(_) => stop(state, outgoingQueue, ui, voiceRef)
       case None    => start(state, outgoingQueue, ui, voiceRef, loopback = true)
     }
 
   private def start(
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui,
-      voiceRef: Ref[IO, Option[Voice]],
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]],
       loopback: Boolean
-  ): IO[Unit] =
-    allow[Audio.AudioError] {
+  ): F[Unit] =
+    allow[AudioError] {
       val micMuted = state.get.map(st => st.muted || st.adminMuted)
-      Audio.open(micMuted).allocated.flatMap { case (handle, release) =>
+      audio.open(micMuted).allocated.flatMap { case (handle, release) =>
         for
-          seq <- Ref.of[IO, Int](0)
+          seq <- Ref.of[F, Int](0)
           captureFib <- handle.frames
             .evalMap { b64 =>
               if loopback then handle.receive("you (test)", b64)
@@ -52,9 +76,9 @@ object Voice:
           playbackFib <- handle.playback.compile.drain.start
           // Readers first: releasing the device under a blocked read throws.
           teardown = playbackFib.cancel *> captureFib.cancel *> release
-          _ <- voiceRef.set(Some(Voice(handle, teardown)))
+          _ <- voiceRef.set(Some(VoiceSession(handle, teardown)))
           _ <- state.update(_.copy(inVoice = true, muted = false))
-          _ <- if loopback then IO.unit else outgoingQueue.offer("VOICEJOIN")
+          _ <- if loopback then ().pure[F] else outgoingQueue.offer("VOICEJOIN")
           _ <- ui.printLine(
             if loopback then
               s"Voice self-test on (audio: ${handle.backend}). Speak and you should hear " +
@@ -71,13 +95,13 @@ object Voice:
     }
 
   private def stop(
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui,
-      voiceRef: Ref[IO, Option[Voice]]
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit] =
     voiceRef.getAndSet(None).flatMap {
-      case None => IO.unit
+      case None => ().pure[F]
       case Some(voice) =>
         state.update(_.copy(inVoice = false, muted = false, voiceUsers = Nil)) *>
           outgoingQueue.offer("VOICELEAVE") *>
@@ -86,11 +110,11 @@ object Voice:
           ui.printLine("Left voice.")
     }
 
-  def toggleMute(
-      state: Ref[IO, ClientState],
-      ui: Ui,
-      voiceRef: Ref[IO, Option[Voice]]
-  ): IO[Unit] =
+  override def toggleMute(
+      state: Ref[F, ClientState[F]],
+      ui: Ui[F],
+      voiceRef: Ref[F, Option[VoiceSession[F]]]
+  ): F[Unit] =
     voiceRef.get.flatMap {
       case None => ui.printLine("You're not in voice. Join with /voice first.")
       case Some(_) =>
@@ -102,3 +126,6 @@ object Voice:
               .flatMap(s => ui.printLine(if s.muted then "Mic muted." else "Mic unmuted."))
         }
     }
+
+object LiveVoice:
+  def apply[F[_]: Concurrent](audio: Audio[F]): Voice[F] = new LiveVoice[F](audio)

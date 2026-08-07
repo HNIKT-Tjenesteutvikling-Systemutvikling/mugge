@@ -5,17 +5,16 @@ import cats.effect.std.Console
 import cats.mtl.Handle.allow
 import com.comcast.ip4s.*
 import fs2.io.net.*
-import org.typelevel.log4cats.Logger as TLogger
 import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
-import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 import java.io.IOException
 import scala.concurrent.duration.*
 
 object ChatClient extends IOApp:
   given LoggerFactory[IO] = Slf4jFactory.create[IO]
-  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
+
+  private val logger = LoggerFactory[IO].getLogger
 
   private val reconnectInitialBackoff = 2.seconds
   private val reconnectMaxBackoff = 30.seconds
@@ -23,15 +22,64 @@ object ChatClient extends IOApp:
   def run(args: List[String]): IO[ExitCode] =
     val insecureTls =
       args.contains("--insecure-tls") || sys.env.get("MUGGE_INSECURE_TLS").contains("1")
-    args.indexOf("--assist") match
-      case idx if idx >= 0 =>
-        args.lift(idx + 1) match
-          case Some(target) => AssistBridge.run(target, insecureTls)
-          case None =>
-            Console[IO].errorln("Usage: mugge-client --assist <user>").as(ExitCode.Error)
-      case _ => runInteractive(args, insecureTls)
 
-  private def runInteractive(args: List[String], insecureTls: Boolean): IO[ExitCode] =
+    val ansi = LiveAnsi()
+    val emoji = LiveEmoji()
+    val markup = LiveMarkup()
+    val highlighter = LiveHighlighter()
+    val userMapping = LiveUserMapping()
+    val tokenizer = LiveTokenizer[IO]()
+    val config = LiveConfig[IO](userMapping)
+    val terminal = LiveTerminal[IO]()
+    val tls = LiveTls[IO]()
+    val authentication = LiveAuthentication[IO]()
+    val audio = LiveAudio[IO]()
+    val idle = LiveIdle[IO]()
+    val notifications = LiveNotifications[IO](audio)
+    val whisper = LiveWhisper[IO](ansi, notifications)
+    val completion = LiveCompletion[IO]()
+    val fileTransfer = LiveFileTransfer[IO](notifications)
+    val voice = LiveVoice[IO](audio)
+    val assist = LiveAssist[IO](notifications, emoji)
+    val userInput =
+      LiveUserInput[IO](completion, fileTransfer, voice, assist, markup, emoji, tokenizer)
+    val session = LiveSession[IO](
+      config,
+      authentication,
+      terminal,
+      idle,
+      userInput,
+      notifications,
+      whisper,
+      fileTransfer,
+      assist,
+      markup,
+      ansi,
+      highlighter
+    )
+    val assistBridge = LiveAssistBridge[IO](config, authentication, tls)
+
+    for
+      // Outlives a session: frontends stay attached across reconnects.
+      ipc <- LiveIpc.create[IO]
+      exitCode <- args.indexOf("--assist") match
+        case idx if idx >= 0 =>
+          args.lift(idx + 1) match
+            case Some(target) => assistBridge.run(target, insecureTls)
+            case None =>
+              Console[IO].errorln("Usage: mugge-client --assist <user>").as(ExitCode.Error)
+        case _ => runInteractive(args, insecureTls, config, authentication, tls, session, ipc)
+    yield exitCode
+
+  private def runInteractive(
+      args: List[String],
+      insecureTls: Boolean,
+      config: Config[IO],
+      authentication: Authentication[IO],
+      tls: Tls[IO],
+      session: Session[IO],
+      ipc: Ipc[IO]
+  ): IO[ExitCode] =
     val positional = args.filterNot(_.startsWith("--"))
     val host = positional.headOption
       .flatMap(Host.fromString)
@@ -47,9 +95,9 @@ object ChatClient extends IOApp:
     for
       _ <- logger.info(s"Mugge Chat Client starting...")
       _ <- logger.info(s"Server: $host:$port")
-      myUsername <- Config.username
+      myUsername <- config.username
       githubUsername <- allow[Authentication.AuthError] {
-        Authentication.detectGithubUsername()
+        authentication.detectGithubUsername()
       }.rescue { err =>
         logger.warn(s"Could not detect GitHub username: ${err.message}").as(None)
       }
@@ -59,7 +107,7 @@ object ChatClient extends IOApp:
         case None      => logger.error("Could not detect GitHub username from git config")
 
       _ <- IO.whenA(insecureTls)(IO.println(Config.insecureTlsNotice))
-      tlsContext <- if insecureTls then Network[IO].tlsContext.insecure else Tls.pinnedContext
+      tlsContext <- if insecureTls then Network[IO].tlsContext.insecure else tls.pinnedContext
       // Outlives a session so input history survives the reconnect loop.
       inputHistory <- Ref.of[IO, InputHistory](InputHistory.empty)
       connectOnce = Network[IO]
@@ -72,13 +120,13 @@ object ChatClient extends IOApp:
             .use { socket =>
               for
                 _ <- IO.println(s"Connected to chat server at $host:$port")
-                state <- Ref.of[IO, ClientState](
-                  ClientState(
+                state <- Ref.of[IO, ClientState[IO]](
+                  ClientState[IO](
                     username = myUsername,
                     githubUsername = githubUsername
                   )
                 )
-                outcome <- Session.run(socket, state, inputHistory)
+                outcome <- session.run(socket, state, inputHistory, ipc)
               yield outcome
             }
         }
@@ -94,7 +142,7 @@ object ChatClient extends IOApp:
               case _ =>
                 logger.error(s"Error: ${err.getMessage}").as(SessionOutcome.ConnectFailed)
         }
-      exitCode <- reconnectLoop(connectOnce, reconnectInitialBackoff)
+      exitCode <- ipc.serve.use(_ => reconnectLoop(connectOnce, reconnectInitialBackoff))
     yield exitCode
 
   private def reconnectLoop(

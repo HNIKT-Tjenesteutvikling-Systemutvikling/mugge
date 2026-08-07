@@ -4,12 +4,12 @@ import cats.effect.*
 import cats.effect.std.Console
 import cats.effect.std.Mutex
 import cats.effect.std.Queue
+import cats.effect.syntax.all.*
 import cats.mtl.Handle.allow
 import cats.syntax.all.*
 import fs2.*
 import fs2.io.net.*
-import org.typelevel.log4cats.Logger as TLogger
-import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.LoggerFactory
 
 import scala.concurrent.duration.*
 
@@ -21,8 +21,29 @@ enum SessionOutcome:
 /** One connected chat session: wires the socket, the keyboard and the timers together and reports
   * how it ended.
   */
-object Session:
-  given logger: TLogger[IO] = Slf4jLogger.getLogger[IO]
+trait Session[F[_]]:
+  def run(
+      socket: Socket[F],
+      state: Ref[F, ClientState[F]],
+      inputHistory: Ref[F, InputHistory],
+      ipc: Ipc[F]
+  ): F[SessionOutcome]
+
+final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
+    config: Config[F],
+    authentication: Authentication[F],
+    terminal: Terminal[F],
+    idle: Idle[F],
+    userInput: UserInput[F],
+    notifications: Notifications[F],
+    whisper: Whisper[F],
+    fileTransfer: FileTransfer[F],
+    assist: Assist[F],
+    markup: Markup,
+    ansi: Ansi,
+    highlighter: Highlighter
+) extends Session[F]:
+  private val logger = LoggerFactory[F].getLogger
 
   private val resizePollInterval = 300.milliseconds
 
@@ -36,17 +57,18 @@ object Session:
 
   private val suspendGraceThreshold = 30.seconds
 
-  def run(
-      socket: Socket[IO],
-      state: Ref[IO, ClientState],
-      inputHistory: Ref[IO, InputHistory]
-  ): IO[SessionOutcome] = {
-    val initialDataIO: IO[String] = for {
-      hostname <- Config.hostname
+  override def run(
+      socket: Socket[F],
+      state: Ref[F, ClientState[F]],
+      inputHistory: Ref[F, InputHistory],
+      ipc: Ipc[F]
+  ): F[SessionOutcome] = {
+    val initialData: F[String] = for {
+      hostname <- config.hostname
       currentState <- state.get
       privateKey <- currentState.githubUsername.flatTraverse { _ =>
         allow[Authentication.AuthError] {
-          Authentication.loadPrivateKey().map(_.some)
+          authentication.loadPrivateKey().map(_.some)
         }.rescue { err =>
           logger.warn(s"Could not load SSH private key: ${err.message}").as(None)
         }.handleErrorWith { err =>
@@ -65,25 +87,25 @@ object Session:
     } yield finalString
 
     (
-      Terminal.size,
-      IO(Option(System.console()).isDefined),
-      Mutex[IO],
-      Queue.bounded[IO, String](1024),
-      Deferred[IO, Either[Throwable, Unit]],
-      IO.monotonic.flatMap(t => Ref.of[IO, FiniteDuration](t)),
-      IO.realTime.flatMap(t => Ref.of[IO, FiniteDuration](t)),
-      Ref.of[IO, Boolean](false),
-      Ref.of[IO, Boolean](false),
-      Ref.of[IO, Boolean](false),
-      Ref.of[IO, String](""),
-      Ref.of[IO, Boolean](false),
-      Ref.of[IO, Int](0),
-      Ref.of[IO, Option[(Int, Int)]](None),
-      Ref.of[IO, Option[Voice]](None),
-      Ref.of[IO, Option[String]](None),
-      Ref.of[IO, Option[PendingPaste]](None),
-      Ref.of[IO, Option[(List[Char], Int)]](None),
-      Ref.of[IO, Vector[String]](Vector.empty)
+      terminal.size,
+      Sync[F].delay(Option(System.console()).isDefined),
+      Mutex[F],
+      Queue.bounded[F, String](1024),
+      Deferred[F, Either[Throwable, Unit]],
+      Clock[F].monotonic.flatMap(t => Ref.of[F, FiniteDuration](t)),
+      Clock[F].realTime.flatMap(t => Ref.of[F, FiniteDuration](t)),
+      Ref.of[F, Boolean](false),
+      Ref.of[F, Boolean](false),
+      Ref.of[F, Boolean](false),
+      Ref.of[F, String](""),
+      Ref.of[F, Boolean](false),
+      Ref.of[F, Int](0),
+      Ref.of[F, Option[(Int, Int)]](None),
+      Ref.of[F, Option[VoiceSession[F]]](None),
+      Ref.of[F, Option[String]](None),
+      Ref.of[F, Option[PendingPaste]](None),
+      Ref.of[F, Option[(List[Char], Int)]](None),
+      Ref.of[F, Vector[String]](Vector.empty)
     ).tupled.flatMap { tup =>
       val (
         initialSize,
@@ -106,14 +128,25 @@ object Session:
         pasteBuf,
         scrollback
       ) = tup
-      val ictl = InputCtl(input, hint, pendingPaste, pasteBuf, composing, inputHistory)
-      val ui = new Ui(mutex, state, ictl, blockLines, pty, termSize, scrollback)
+      val ictl = InputCtl[F](input, hint, pendingPaste, pasteBuf, composing, inputHistory)
+      val ui = LiveUi[F](
+        mutex,
+        state,
+        ictl,
+        blockLines,
+        pty,
+        termSize,
+        scrollback,
+        ansi,
+        highlighter,
+        terminal
+      )
 
-      val serverWriter: Stream[IO, Nothing] =
-        (Stream.eval(initialDataIO) ++ Stream.fromQueueUnterminated(outgoingQueue))
+      val serverWriter: Stream[F, Nothing] =
+        (Stream.eval(initialData) ++ Stream.fromQueueUnterminated(outgoingQueue))
           .map(_ + "\n")
           .evalTap {
-            case data if controlNoise(data.trim) => IO.unit
+            case data if controlNoise(data.trim) => ().pure[F]
             case data if sensitiveOutbound(data.trim) =>
               logger.debug("Writing to server: <redacted sensitive line>")
             case data => logger.debug(s"Writing to server: $data")
@@ -122,7 +155,7 @@ object Session:
           .through(socket.writes)
           .onFinalize(logger.debug("Server writer stream finished."))
 
-      val serverReader: Stream[IO, Unit] =
+      val serverReader: Stream[F, Unit] =
         readFromServer(
           socket,
           state,
@@ -132,37 +165,38 @@ object Session:
           halt,
           incompatible,
           denied,
-          voiceRef
+          voiceRef,
+          ipc
         )
           .onFinalize(logger.debug("Server reader stream finished."))
 
-      val userReader: Stream[IO, Unit] =
-        UserInput
+      val userReader: Stream[F, Unit] =
+        userInput
           .readFromUser(outgoingQueue, halt, state, ui, ictl, voiceRef)
           .onFinalize(logger.debug("User reader stream finished."))
 
-      val pinger: Stream[IO, Unit] =
+      val pinger: Stream[F, Unit] =
         Stream
-          .awakeEvery[IO](Config.pingInterval)
+          .awakeEvery[F](Config.pingInterval)
           .evalMap(_ => outgoingQueue.offer("PING"))
 
-      val typingRefresher: Stream[IO, Unit] =
-        Stream.awakeEvery[IO](typingRefreshInterval).evalMap { _ =>
+      val typingRefresher: Stream[F, Unit] =
+        Stream.awakeEvery[F](typingRefreshInterval).evalMap { _ =>
           (composing.get, input.get).flatMapN { (c, inp) =>
-            if c && inp.nonEmpty then outgoingQueue.offer("TYPING") else IO.unit
+            if c && inp.nonEmpty then outgoingQueue.offer("TYPING") else ().pure[F]
           }
         }
 
-      val awayWatcher: Stream[IO, Unit] =
-        Stream.eval(Ref.of[IO, AwayHold](None)).flatMap { held =>
-          Idle.transitions(awayAfter).evalMap(idle => applyAway(idle, held, state, outgoingQueue))
+      val awayWatcher: Stream[F, Unit] =
+        Stream.eval(Ref.of[F, AwayHold](None)).flatMap { held =>
+          idle.transitions(awayAfter).evalMap(i => applyAway(i, held, state, outgoingQueue))
         }
 
-      val watchdog: Stream[IO, Unit] =
-        Stream.awakeEvery[IO](watchdogInterval).evalMap { _ =>
+      val watchdog: Stream[F, Unit] =
+        Stream.awakeEvery[F](watchdogInterval).evalMap { _ =>
           for
-            now <- IO.monotonic
-            wall <- IO.realTime
+            now <- Clock[F].monotonic
+            wall <- Clock[F].realTime
             last <- lastReceived.get
             prevWall <- lastWatchdogWall.getAndSet(wall)
             resumed = (wall - prevWall) > (watchdogInterval + suspendGraceThreshold)
@@ -175,26 +209,26 @@ object Session:
                 connectionLost.set(true) *>
                   ui.printLine("Connection lost: no response from server.") *>
                   halt.complete(Right(())).void
-              else IO.unit
+              else ().pure[F]
           yield ()
         }
 
-      val terminalWatcher: Stream[IO, Unit] =
-        if !pty then Stream.empty.covary[IO]
+      val terminalWatcher: Stream[F, Unit] =
+        if !pty then Stream.empty.covary[F]
         else
-          Stream.eval(Ref.of[IO, Option[(Int, Int)]](None)).flatMap { lastPoll =>
-            Stream.awakeEvery[IO](resizePollInterval).evalMap { _ =>
-              Terminal.size.flatMap { latest =>
+          Stream.eval(Ref.of[F, Option[(Int, Int)]](None)).flatMap { lastPoll =>
+            Stream.awakeEvery[F](resizePollInterval).evalMap { _ =>
+              terminal.size.flatMap { latest =>
                 (lastPoll.getAndSet(latest), termSize.get).flatMapN { (prevPoll, committed) =>
                   // Re-arm bracketed paste when the pty first appears.
                   val rearm =
                     if prevPoll.isEmpty && latest.isDefined then
-                      Console[IO].print(Terminal.enableInputModes)
-                    else IO.unit
+                      Console[F].print(Terminal.enableInputModes)
+                    else ().pure[F]
                   // Debounce: repaint once two consecutive polls agree, so a
                   // drag-resize redraws once at the final size.
                   val apply =
-                    if latest == prevPoll && latest != committed then ui.redraw else IO.unit
+                    if latest == prevPoll && latest != committed then ui.redraw else ().pure[F]
                   rearm *> apply
                 }
               }
@@ -213,8 +247,12 @@ object Session:
           awayWatcher
         )
 
-      Terminal.rawMode(pty).use { _ =>
+      val ipcSession =
+        ipc.bind(line => userInput.dispatchLine(line, outgoingQueue, halt, state, ui, voiceRef))
+
+      (terminal.rawMode(pty) *> ipcSession).use { _ =>
         termSize.set(initialSize) >>
+          state.get.flatMap(st => ipc.me(st.username)) >>
           logger.debug("Starting chat streams...") >>
           ui.refreshInput >>
           streams.parJoinUnbounded
@@ -257,25 +295,26 @@ object Session:
       line.startsWith("ASSISTDATA:")
 
   private def readFromServer(
-      socket: Socket[IO],
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String],
-      ui: Ui,
-      lastReceived: Ref[IO, FiniteDuration],
-      halt: Deferred[IO, Either[Throwable, Unit]],
-      incompatible: Ref[IO, Boolean],
-      denied: Ref[IO, Boolean],
-      voiceRef: Ref[IO, Option[Voice]]
-  ): Stream[IO, Nothing] =
-    Stream.eval(Ref.of[IO, Map[String, CodeAccum]](Map.empty)).flatMap { codeAccum =>
+      socket: Socket[F],
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F],
+      lastReceived: Ref[F, FiniteDuration],
+      halt: Deferred[F, Either[Throwable, Unit]],
+      incompatible: Ref[F, Boolean],
+      denied: Ref[F, Boolean],
+      voiceRef: Ref[F, Option[VoiceSession[F]]],
+      ipc: Ipc[F]
+  ): Stream[F, Nothing] =
+    Stream.eval(Ref.of[F, Map[String, CodeAccum]](Map.empty)).flatMap { codeAccum =>
       socket.reads
         .through(text.utf8.decode)
         .through(text.lines)
         .filter(_.nonEmpty)
         .evalMap { msg =>
-          IO.monotonic.flatMap(lastReceived.set) *> state.get.flatMap { st =>
+          Clock[F].monotonic.flatMap(lastReceived.set) *> state.get.flatMap { st =>
             val me = st.username
-            if msg == "PONG" then IO.unit
+            if msg == "PONG" then ().pure[F]
             else if msg.startsWith("INCOMPATIBLE:") then
               incompatible.set(true) *>
                 ui.printLine(msg.drop("INCOMPATIBLE:".length)) *>
@@ -293,20 +332,29 @@ object Session:
             else if msg.startsWith("NICK:") then
               val newName = msg.drop("NICK:".length).trim
               state.update(_.copy(username = newName)) *>
+                ipc.me(newName) *>
                 ui.printLine(s"${serverColor}You are now known as $newName$ansiReset")
             // Replayed history renders like chat (code blocks included) but must
             // not re-fire mention/ping notifications or carry today's statuses.
             else if msg.startsWith("HIST:") then
-              handleIncomingChat(msg.drop("HIST:".length), me, state, ui, codeAccum, live = false)
+              handleIncomingChat(
+                msg.drop("HIST:".length),
+                me,
+                state,
+                ui,
+                codeAccum,
+                ipc,
+                live = false
+              )
             else if msg.startsWith("STATUS:") then
               msg.split(":", 3) match
                 case Array(_, name, text) =>
                   val trimmed = text.trim
                   ui.setStatuses(name.trim, if trimmed.isEmpty then None else Some(trimmed))
-                case _ => IO.unit
+                case _ => ().pure[F]
             else if msg.startsWith("USERS:") then
               val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
-              ui.setUsers(users)
+              ui.setUsers(users) *> ipc.users(users)
             else if msg.startsWith("TYPING:") then
               val users = msg
                 .drop(7)
@@ -315,7 +363,7 @@ object Session:
                 .filter(_.nonEmpty)
                 .filterNot(_.equalsIgnoreCase(me))
                 .toList
-              ui.setTyping(users)
+              ui.setTyping(users) *> ipc.typing(users)
             else if msg.startsWith("VOICEUSERS:") then
               val users =
                 msg.drop("VOICEUSERS:".length).split(",").map(_.trim).filter(_.nonEmpty).toList
@@ -324,21 +372,24 @@ object Session:
               msg.split(":", 4) match
                 case Array(_, from, _, b64) =>
                   voiceRef.get.flatMap(_.traverse_(_.handle.receive(from, b64)))
-                case _ => IO.unit
-            else if msg.startsWith("REMIND:") then Notifications.reminder(msg, me, ui)
-            else if msg.startsWith("FILEOFFER:") then FileTransfer.offer(msg, state, ui)
+                case _ => ().pure[F]
+            else if msg.startsWith("NUDGE:") then notifications.nudge(msg, state)
+            else if msg.startsWith("WHISPERTO:") then whisper.outgoing(msg, ui, ipc)
+            else if msg.startsWith("WHISPER:") then whisper.incoming(msg, ui, ipc)
+            else if msg.startsWith("REMIND:") then notifications.reminder(msg, me, ui)
+            else if msg.startsWith("FILEOFFER:") then fileTransfer.offer(msg, state, ui)
             else if msg.startsWith("FILEACCEPT:") then
-              FileTransfer.accept(msg.drop(11).trim, state, outgoingQueue, ui)
+              fileTransfer.accept(msg.drop(11).trim, state, outgoingQueue, ui)
             else if msg.startsWith("FILEREJECT:") then
-              FileTransfer.reject(msg.drop(11).trim, state, ui)
-            else if msg.startsWith("FILEDATA:") then FileTransfer.data(msg, state, ui)
-            else if msg.startsWith("FILEEND:") then FileTransfer.end(msg, state, ui)
-            else if msg.startsWith("ASSISTDATA:") then Assist.data(msg, state)
-            else if msg.startsWith("ASSISTEND:") then Assist.end(msg, state, ui)
+              fileTransfer.reject(msg.drop(11).trim, state, ui)
+            else if msg.startsWith("FILEDATA:") then fileTransfer.data(msg, state, ui)
+            else if msg.startsWith("FILEEND:") then fileTransfer.end(msg, state, ui)
+            else if msg.startsWith("ASSISTDATA:") then assist.data(msg, state)
+            else if msg.startsWith("ASSISTEND:") then assist.end(msg, state, ui)
             else if msg.startsWith("ASSISTREQ:") then
-              Assist.consentRequest(msg, state, outgoingQueue, ui)
-            else if msg.startsWith("ASSIST:") then Assist.start(msg, state, outgoingQueue, ui)
-            else handleIncomingChat(msg, me, state, ui, codeAccum)
+              assist.consentRequest(msg, state, outgoingQueue, ui)
+            else if msg.startsWith("ASSIST:") then assist.start(msg, state, outgoingQueue, ui)
+            else handleIncomingChat(msg, me, state, ui, codeAccum, ipc)
           }
         }
         .drain
@@ -347,17 +398,25 @@ object Session:
   private def handleIncomingChat(
       msg: String,
       me: String,
-      state: Ref[IO, ClientState],
-      ui: Ui,
-      codeAccum: Ref[IO, Map[String, CodeAccum]],
+      state: Ref[F, ClientState[F]],
+      ui: Ui[F],
+      codeAccum: Ref[F, Map[String, CodeAccum]],
+      ipc: Ipc[F],
       live: Boolean = true
-  ): IO[Unit] =
-    def plain: IO[Unit] =
-      if live then
-        Ui.colorize(msg, state).flatMap(ui.printLine) >>
-          Notifications.mentions(msg, me) >>
-          Notifications.pings(msg, me, state)
-      else Ui.colorize(msg, state, withStatus = false).flatMap(ui.printLine)
+  ): F[Unit] =
+    // Code blocks are published once, assembled, from renderCodeBody; every
+    // other displayed line lands here exactly once.
+    def publish: F[Unit] =
+      msg match
+        case Markup.displayPattern(time, indicator, sender, content) =>
+          ipc.message(time, indicator, sender.trim, content, history = !live)
+        case _ => ipc.notice(msg)
+
+    def plain: F[Unit] =
+      publish >>
+        (if live then
+           ui.colorize(msg, state).flatMap(ui.printLine) >> notifications.mentions(msg, me)
+         else ui.colorize(msg, state, withStatus = false).flatMap(ui.printLine))
 
     msg match
       case Markup.displayPattern(time, indicator, senderRaw, content) =>
@@ -368,7 +427,7 @@ object Session:
               val body = acc.body :+ content.stripPrefix("│ ").stripPrefix("│")
               if acc.remaining <= 1 then
                 codeAccum.update(_ - sender) *>
-                  renderCodeBody(time, indicator, sender, body, ui)
+                  renderCodeBody(time, indicator, sender, body, ui, ipc, history = !live)
               else codeAccum.update(_ + (sender -> CodeAccum(acc.remaining - 1, body)))
             case _ =>
               content match
@@ -378,9 +437,17 @@ object Session:
                       codeAccum.update(_ + (sender -> CodeAccum(count, Vector.empty)))
                     case None => plain
                 case _ =>
-                  Markup.inlineCode(content) match
+                  markup.inlineCode(content) match
                     case Some(code) =>
-                      renderCodeBody(time, indicator, sender, Vector(code), ui)
+                      renderCodeBody(
+                        time,
+                        indicator,
+                        sender,
+                        Vector(code),
+                        ui,
+                        ipc,
+                        history = !live
+                      )
                     case None => plain
         }
       case _ => plain
@@ -392,18 +459,21 @@ object Session:
       indicator: String,
       sender: String,
       body: Vector[String],
-      ui: Ui
-  ): IO[Unit] =
-    val (lang, code) = body.headOption.flatMap(Markup.fenceLang) match
+      ui: Ui[F],
+      ipc: Ipc[F],
+      history: Boolean
+  ): F[Unit] =
+    val (lang, code) = body.headOption.flatMap(markup.fenceLang) match
       case Some(l) => (l, body.drop(1).dropRight(1).toList)
       case None    => ("", body.toList)
-    ui.printCodeBlock(time, indicator, sender, lang, code)
+    ipc.codeMessage(time, indicator, sender, lang, code, history) *>
+      ui.printCodeBlock(time, indicator, sender, lang, code)
 
   private def handleAutoChallenge(
       challenge: String,
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String]
-  ): IO[Unit] =
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String]
+  ): F[Unit] =
     for {
       currentState <- state.get
       _ <- (currentState.privateKey, currentState.githubUsername) match {
@@ -411,7 +481,7 @@ object Session:
           allow[Authentication.AuthError] {
             for {
               _ <- logger.debug(s"Received auto-auth challenge, signing for '$githubUsername'...")
-              signature <- Authentication.signChallenge(challenge, privateKey)
+              signature <- authentication.signChallenge(challenge, privateKey)
               _ <- outgoingQueue.offer(s"SIGNATURE:$signature")
               _ <- logger.debug("Auto-authentication response sent to queue.")
             } yield ()
@@ -429,18 +499,48 @@ object Session:
   private type AwayHold = Option[Option[String]]
 
   private def applyAway(
-      idle: Boolean,
-      held: Ref[IO, AwayHold],
-      state: Ref[IO, ClientState],
-      outgoingQueue: Queue[IO, String]
-  ): IO[Unit] =
+      idleNow: Boolean,
+      held: Ref[F, AwayHold],
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String]
+  ): F[Unit] =
     (state.get, held.get).flatMapN { (st, hold) =>
-      (hold, idle) match
+      (hold, idleNow) match
         case (None, true) if !st.inVoice =>
           held.set(Some(st.statuses.get(st.username))) *>
             outgoingQueue.offer(s"/status $awayStatus")
         case (Some(previous), false) =>
           held.set(None) *>
             outgoingQueue.offer(previous.fold("/status")(text => s"/status $text"))
-        case _ => IO.unit
+        case _ => ().pure[F]
     }
+
+object LiveSession:
+  def apply[F[_]: Async: Console: LoggerFactory](
+      config: Config[F],
+      authentication: Authentication[F],
+      terminal: Terminal[F],
+      idle: Idle[F],
+      userInput: UserInput[F],
+      notifications: Notifications[F],
+      whisper: Whisper[F],
+      fileTransfer: FileTransfer[F],
+      assist: Assist[F],
+      markup: Markup,
+      ansi: Ansi,
+      highlighter: Highlighter
+  ): Session[F] =
+    new LiveSession[F](
+      config,
+      authentication,
+      terminal,
+      idle,
+      userInput,
+      notifications,
+      whisper,
+      fileTransfer,
+      assist,
+      markup,
+      ansi,
+      highlighter
+    )
