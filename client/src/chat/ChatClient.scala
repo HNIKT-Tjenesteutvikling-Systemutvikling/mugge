@@ -60,7 +60,6 @@ object ChatClient extends IOApp:
     val assistBridge = LiveAssistBridge[IO](config, authentication, tls)
 
     for
-      // Outlives a session: frontends stay attached across reconnects.
       ipc <- LiveIpc.create[IO]
       exitCode <- args.indexOf("--assist") match
         case idx if idx >= 0 =>
@@ -108,7 +107,6 @@ object ChatClient extends IOApp:
 
       _ <- IO.whenA(insecureTls)(IO.println(Config.insecureTlsNotice))
       tlsContext <- if insecureTls then Network[IO].tlsContext.insecure else tls.pinnedContext
-      // Outlives a session so input history survives the reconnect loop.
       inputHistory <- Ref.of[IO, InputHistory](InputHistory.empty)
       connectOnce = Network[IO]
         .connect(SocketAddress(host, port))
@@ -152,8 +150,7 @@ object ChatClient extends IOApp:
     connectOnce.flatMap {
       case SessionOutcome.Quit         => IO.println("Bye!").as(ExitCode.Success)
       case SessionOutcome.Incompatible => IO.pure(ExitCode.Error)
-      // Refusal is terminal: exit clean so service mode does not respawn-loop.
-      case SessionOutcome.Denied => IO.pure(ExitCode.Success)
+      case SessionOutcome.Denied       => IO.pure(ExitCode.Success)
       case SessionOutcome.Lost =>
         if !Config.serviceMode then
           IO.println("Connection lost — restart the client to reconnect.").as(ExitCode.Error)

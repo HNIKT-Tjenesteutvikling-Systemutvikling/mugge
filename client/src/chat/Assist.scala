@@ -91,7 +91,6 @@ final class LiveAssist[F[_]: Async: Processes: LoggerFactory] private (
           case Nil              => (st, None)
       }
       .flatMap {
-        // No pending request: yes/no is just chat.
         case None => outgoingQueue.offer(emoji.expand(raw))
         case Some((id, adminName)) =>
           if approve then
@@ -134,8 +133,6 @@ final class LiveAssist[F[_]: Async: Processes: LoggerFactory] private (
         urgency = "critical",
         timeout = 0
       )
-      // pty via `script`: TRAMP hangs on a piped /bin/sh (no prompt, no stty).
-      // SHELL pinned because `script -c` runs the command via $SHELL (fish here).
       spawned <- ProcessBuilder("script", "-qfc", "/bin/sh -i", "/dev/null")
         .withExtraEnv(Map("SHELL" -> "/bin/sh"))
         .spawn[F]

@@ -48,9 +48,6 @@ final class LiveIdle[F[_]: Async: Files: Processes: LoggerFactory] private () ex
       allow[IdleError](backend(after)).rescue { err =>
         logger.debug(s"No idle backend available: ${err.message}").as(Stream.empty)
       }
-    // Re-resolved on every stop: the always-on service starts before the
-    // compositor, so the first probe can come up empty, and a compositor
-    // restart takes swayidle with it.
     val attempt = Stream.eval(resolve).flatten.handleErrorWith { err =>
       Stream.exec(logger.debug(s"Idle backend stopped: ${err.getMessage}"))
     }
@@ -67,8 +64,6 @@ final class LiveIdle[F[_]: Async: Files: Processes: LoggerFactory] private () ex
       case None    => swayidleTransitions(after)
     }
 
-  // Mutter reports idle time but offers no event to await, so GNOME is polled;
-  // every other compositor is subscribed to through swayidle.
   private def mutterTransitions(after: FiniteDuration): Stream[F, Boolean] =
     Stream.eval(Ref.of[F, Boolean](false)).flatMap { wasIdle =>
       Stream
@@ -116,15 +111,11 @@ final class LiveIdle[F[_]: Async: Files: Processes: LoggerFactory] private () ex
             case "idle"   => true
             case "active" => false
           }
-          // fs2 always pipes stderr; left undrained, swayidle's logging would
-          // eventually block on a full pipe.
           .concurrently(process.stderr.drain)
           .onFinalize(release)
       }
     }
 
-  // The unit's environment snapshot predates the graphical session, so
-  // WAYLAND_DISPLAY is usually missing: resolve the socket from the runtime dir.
   private def waylandEnv: F[Map[String, String]] =
     if sys.env.contains("WAYLAND_DISPLAY") then Map.empty[String, String].pure[F]
     else

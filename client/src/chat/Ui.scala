@@ -46,7 +46,6 @@ final class LiveUi[F[_]: Async: Console] private (
 
   private val inputPrompt = "> "
 
-  // dtach keeps no scrollback, so the client keeps its own to repaint on attach.
   private val scrollbackSize = 200
 
   private val codeBorderColor = "\u001b[38;5;240m"
@@ -160,8 +159,6 @@ final class LiveUi[F[_]: Async: Console] private (
       }
     }
 
-  // Re-detect the size first so it repaints straight out of the headless
-  // (None) state on the first attach, before the watcher poll lands.
   override def redraw: F[Unit] =
     terminal.size.flatMap { latest =>
       mutex.lock.surround {
@@ -197,7 +194,6 @@ final class LiveUi[F[_]: Async: Console] private (
   private def plainPrint(line: String): F[Unit] =
     if pty then Console[F].print(line + "\r\n") else Console[F].println(line)
 
-  // Stored pre-wrap so a redraw re-wraps at the current width.
   private def appendScrollback(line: String): F[Unit] =
     scrollback.update(v => (v :+ line).takeRight(scrollbackSize))
 
@@ -356,10 +352,7 @@ final class LiveUi[F[_]: Async: Console] private (
     state.modify { st =>
       st.colors.get(name) match
         case Some(idx) => (st, idx)
-        case None      =>
-          // Only colours in use by someone online are off limits; names that
-          // left or were renamed away release theirs, so a long session does
-          // not wrap around and hand two people in the room the same colour.
+        case None =>
           val live = (st.onlineUsers.toSet - name).flatMap(st.colors.get)
           val idx = ansiPalette.indices
             .find(!live.contains(_))

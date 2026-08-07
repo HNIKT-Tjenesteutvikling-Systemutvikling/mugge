@@ -67,7 +67,6 @@ final class LiveTokenizer[F[_]] private () extends Tokenizer[F]:
             else (EscState.Ground, List(InputToken.Ch(c)))
           case EscState.Esc =>
             if c == '[' then (EscState.Csi(""), Nil)
-            // SS3: in application-cursor-key mode an arrow arrives as ESC O A.
             else if c == 'O' then (EscState.Ss3, Nil)
             else if c == '\r' || c == '\n' then (EscState.Ground, List(InputToken.Newline))
             else (EscState.Ground, Nil)
@@ -95,8 +94,6 @@ object LiveTokenizer:
     case Ground, Esc, Ss3
     case Csi(params: String)
 
-  // Kitty keyboard protocol: a modified Enter (e.g. Shift+Enter -> ESC[13;2u)
-  // inserts a newline; an unmodified one still submits.
   private def csiUToken(params: String): List[InputToken] =
     params.split(";").toList match
       case key :: rest if key == "13" || key == "10" =>

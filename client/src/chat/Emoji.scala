@@ -59,8 +59,6 @@ object Emoji:
     "zzz" -> "💤"
   )
 
-  // Classic emoticons, expanded only when they stand alone (surrounded by
-  // whitespace or line edges) so URLs and times pass through untouched.
   val emoticons: Map[String, String] = Map(
     ":)" -> "🙂",
     ":(" -> "🙁",

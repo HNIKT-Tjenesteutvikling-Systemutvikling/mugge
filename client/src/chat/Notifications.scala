@@ -29,14 +29,12 @@ final class LiveNotifications[F[_]: Async: LoggerFactory] private (
 
   override def mentions(line: String, myUsername: String): F[Unit] =
     val messagePattern = """^\[(\d{2}:\d{2}:\d{2})\] [✓?] ([^:]+): (.+)$""".r
-    // Unicode-aware so that "@Bjørn" is one mention, not "@Bj".
     val mentionPattern = """@([\p{L}\p{M}\p{N}_-]+)""".r
 
     line match
       case messagePattern(_, sender, content) =>
         val mentions = mentionPattern.findAllMatchIn(content).map(_.group(1)).toSet
         val direct = mentions.exists(_.equalsIgnoreCase(myUsername))
-        // @all reaches the room, so it must not notify the sender of their own line.
         val everyone =
           mentions.exists(_.equalsIgnoreCase("all")) &&
             !sender.trim.equalsIgnoreCase(myUsername)

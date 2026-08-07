@@ -221,9 +221,6 @@ final class LiveAudio[F[_]: Async: Processes] private () extends Audio[F]:
       name: String
   )
 
-  // JavaSound cannot do full duplex through PipeWire's ALSA device: once the
-  // capture line is open the playback line stays silent. The PipeWire tools
-  // handle both directions and follow the desktop's default source and sink.
   private def pipewireIo: Resource[F, Io] =
     for
       recorder <- ProcessBuilder("pw-record", pipewireArgs).spawn[F]
@@ -236,8 +233,6 @@ final class LiveAudio[F[_]: Async: Processes] private () extends Audio[F]:
         .compile
         .drain
         .background
-      // fs2 always pipes stderr; left undrained, the tools would eventually
-      // block on a full pipe.
       _ <- recorder.stderr.merge(player.stderr).compile.drain.background
     yield Io(
       recorder.stdout.chunkN(Audio.frameBytes, allowFewer = false).map(_.toArray),

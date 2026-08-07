@@ -74,7 +74,6 @@ final class LiveVoice[F[_]: Concurrent] private (audio: Audio[F]) extends Voice[
             .drain
             .start
           playbackFib <- handle.playback.compile.drain.start
-          // Readers first: releasing the device under a blocked read throws.
           teardown = playbackFib.cancel *> captureFib.cancel *> release
           _ <- voiceRef.set(Some(VoiceSession(handle, teardown)))
           _ <- state.update(_.copy(inVoice = true, muted = false))

@@ -220,13 +220,10 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
             Stream.awakeEvery[F](resizePollInterval).evalMap { _ =>
               terminal.size.flatMap { latest =>
                 (lastPoll.getAndSet(latest), termSize.get).flatMapN { (prevPoll, committed) =>
-                  // Re-arm bracketed paste when the pty first appears.
                   val rearm =
                     if prevPoll.isEmpty && latest.isDefined then
                       Console[F].print(Terminal.enableInputModes)
                     else ().pure[F]
-                  // Debounce: repaint once two consecutive polls agree, so a
-                  // drag-resize redraws once at the final size.
                   val apply =
                     if latest == prevPoll && latest != committed then ui.redraw else ().pure[F]
                   rearm *> apply
@@ -334,8 +331,6 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
               state.update(_.copy(username = newName)) *>
                 ipc.me(newName) *>
                 ui.printLine(s"${serverColor}You are now known as $newName$ansiReset")
-            // Replayed history renders like chat (code blocks included) but must
-            // not re-fire mention/ping notifications or carry today's statuses.
             else if msg.startsWith("HIST:") then
               handleIncomingChat(
                 msg.drop("HIST:".length),
@@ -404,8 +399,6 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
       ipc: Ipc[F],
       live: Boolean = true
   ): F[Unit] =
-    // Code blocks are published once, assembled, from renderCodeBody; every
-    // other displayed line lands here exactly once.
     def publish: F[Unit] =
       msg match
         case Markup.displayPattern(time, indicator, sender, content) =>
@@ -452,8 +445,6 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
         }
       case _ => plain
 
-  // `body` still carries the literal fences on a framed block; drop them and
-  // take the lang from the opening fence. An inline snippet arrives fence-free.
   private def renderCodeBody(
       time: String,
       indicator: String,
@@ -494,8 +485,6 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
       }
     } yield ()
 
-  // Some(previous) exactly while the away override is ours to undo, so a status
-  // the user set by hand is never overwritten or restored on their behalf.
   private type AwayHold = Option[Option[String]]
 
   private def applyAway(

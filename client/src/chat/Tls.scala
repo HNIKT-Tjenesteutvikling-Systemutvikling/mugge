@@ -18,10 +18,6 @@ trait Tls[F[_]]:
   def pinnedContext: F[TLSContext[F]]
 
 object Tls:
-  // Base64 SHA-256 of the server's SubjectPublicKeyInfo, pinned like the
-  // AuthorizedUser allowlist (public by design). Primary is deployed via the
-  // server's MUGGE_TLS_KEY; backup is the offline spare kept for rotation.
-  // Mint/rotate with `nix develop -c mintTlsKey <name>` in mugge-server.
   private val pins: Set[String] = Set(
     "tVLA+aVAEJOZ0T7/5mkp3JbXN1ZftouoYRESdpriYwU=",
     "xabpD6pP6GsRQ8kaM4D+2aDZVbWSTq7V4G5kwlZnRzs="

@@ -50,7 +50,6 @@ object Authentication:
     case LeifEggenfellner extends AuthorizedUser("leifeggenfellner")
     case Knotilla extends AuthorizedUser("knotilla")
 
-  // Hand-synced mirror of the server's AdminUser; not used at runtime here.
   enum AdminUser(val githubUsername: String):
     case Gako358 extends AdminUser("Gako358")
     case Merrinx extends AdminUser("merrinx")

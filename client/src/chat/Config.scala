@@ -21,18 +21,12 @@ object Config:
   val insecureTlsNotice =
     "⚠ --insecure-tls: the server certificate is NOT verified. Local dev only."
 
-  // Wire-protocol version sent to the server on connect. Bump in BOTH repos
-  // when a change makes older clients incompatible; the server refuses any
-  // client below its required minimum with an update-and-rebuild message.
   val protocolVersion = 9
 
   val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 
   val noAssist: Boolean = sys.env.get("MUGGE_NO_ASSIST").contains("1")
 
-  // Companion socket for external frontends (VS Code sidebar, editors). They
-  // must drive this session instead of opening their own: the server displaces
-  // an older session when the same user reconnects.
   val ipcEnabled: Boolean = !sys.env.get("MUGGE_NO_IPC").contains("1")
 
   val ipcSocketPath: String =

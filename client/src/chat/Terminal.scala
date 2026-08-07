@@ -11,8 +11,6 @@ trait Terminal[F[_]]:
   def rawMode(pty: Boolean): Resource[F, Unit]
 
 object Terminal:
-  // Bracketed paste + the Kitty keyboard protocol (flag 1, "disambiguate"), so
-  // Shift+Enter arrives as ESC[13;2u instead of a bare CR we can't tell apart.
   val enableInputModes = "\u001b[?2004h\u001b[>1u"
   private[chat] val disableInputModes = "\u001b[?2004l\u001b[<u"
 

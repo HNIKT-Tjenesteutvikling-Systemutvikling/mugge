@@ -175,8 +175,6 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
   override def serve: Resource[F, Unit] =
     if !enabled then Resource.unit
     else
-      // bind fails on a socket file left behind by a crash, so clear it on both
-      // ends of the resource.
       Resource.make(clearSocket)(_ => clearSocket) *>
         Resource.eval(logger.debug(s"IPC socket listening on ${Config.ipcSocketPath}")) *>
         Network[F]
