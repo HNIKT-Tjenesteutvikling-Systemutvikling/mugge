@@ -38,13 +38,24 @@ object InputHistory:
         (h.copy(pos = None, draft = ""), Some(h.draft))
       case Some(i) => (h.copy(pos = Some(i + 1)), Some(h.entries(i + 1)))
 
+/** `text` is the prompt content the cycle last produced; a Tab on anything else restarts completion
+  * instead of stepping. `index` is -1 while only the common prefix has been inserted.
+  */
+final case class CompletionCycle(
+    head: String,
+    candidates: List[String],
+    index: Int,
+    text: String
+)
+
 final case class InputCtl[F[_]](
     text: Ref[F, String],
     hint: Ref[F, Option[String]],
     pendingPaste: Ref[F, Option[PendingPaste]],
     paste: Ref[F, Option[(List[Char], Int)]],
     composing: Ref[F, Boolean],
-    history: Ref[F, InputHistory]
+    history: Ref[F, InputHistory],
+    cycle: Ref[F, Option[CompletionCycle]]
 )
 
 enum InputToken:

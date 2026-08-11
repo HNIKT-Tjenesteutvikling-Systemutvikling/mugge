@@ -105,7 +105,8 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
       Ref.of[F, Option[String]](None),
       Ref.of[F, Option[PendingPaste]](None),
       Ref.of[F, Option[(List[Char], Int)]](None),
-      Ref.of[F, Vector[String]](Vector.empty)
+      Ref.of[F, Vector[String]](Vector.empty),
+      Ref.of[F, Option[CompletionCycle]](None)
     ).tupled.flatMap { tup =>
       val (
         initialSize,
@@ -126,9 +127,11 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
         hint,
         pendingPaste,
         pasteBuf,
-        scrollback
+        scrollback,
+        completionCycle
       ) = tup
-      val ictl = InputCtl[F](input, hint, pendingPaste, pasteBuf, composing, inputHistory)
+      val ictl =
+        InputCtl[F](input, hint, pendingPaste, pasteBuf, composing, inputHistory, completionCycle)
       val ui = LiveUi[F](
         mutex,
         state,

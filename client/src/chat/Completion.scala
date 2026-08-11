@@ -35,24 +35,55 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
     ictl.pendingPaste.get.flatMap {
       case Some(_) => Applicative[F].unit
       case None =>
-        (ictl.text.get, state.get).flatMapN { (inp, st) =>
-          completionFor(inp, st).flatMap {
-            case Nil => ictl.hint.set(None) *> ui.refreshInput
-            case single :: Nil =>
-              val done = if single.endsWith("/") then single else single + " "
-              ictl.text.set(splitLastToken(inp)._1 + done) *>
-                ictl.hint.set(None) *>
-                ui.refreshInput
-            case candidates =>
-              val (head, token) = splitLastToken(inp)
-              val lcp = commonPrefix(candidates)
-              val extended = if lcp.length > token.length then head + lcp else inp
-              ictl.text.set(extended) *>
-                ictl.hint.set(Some(candidates.mkString("  "))) *>
-                ui.refreshInput
-          }
+        (ictl.text.get, ictl.cycle.get).flatMapN { (inp, cycle) =>
+          cycle match
+            case Some(c) if c.text == inp && c.candidates.nonEmpty => step(c, ui, ictl)
+            case _                                                 => start(inp, state, ui, ictl)
         }
     }
+
+  private def start(
+      inp: String,
+      state: Ref[F, ClientState[F]],
+      ui: Ui[F],
+      ictl: InputCtl[F]
+  ): F[Unit] =
+    state.get.flatMap(completionFor(inp, _)).flatMap {
+      case Nil =>
+        ictl.cycle.set(None) *> ictl.hint.set(None) *> ui.refreshInput
+      case single :: Nil =>
+        ictl.text.set(splitLastToken(inp)._1 + accept(single)) *>
+          ictl.cycle.set(None) *>
+          ictl.hint.set(None) *>
+          ui.refreshInput
+      case candidates =>
+        val (head, token) = splitLastToken(inp)
+        val fresh = CompletionCycle(head, candidates, -1, inp)
+        val lcp = commonPrefix(candidates)
+        if lcp.length > token.length then
+          val extended = head + lcp
+          ictl.text.set(extended) *>
+            ictl.cycle.set(Some(fresh.copy(text = extended))) *>
+            ictl.hint.set(Some(hintFor(candidates, -1))) *>
+            ui.refreshInput
+        else step(fresh, ui, ictl)
+    }
+
+  private def step(c: CompletionCycle, ui: Ui[F], ictl: InputCtl[F]): F[Unit] =
+    val i = (c.index + 1) % c.candidates.size
+    val text = c.head + accept(c.candidates(i))
+    ictl.text.set(text) *>
+      ictl.cycle.set(Some(c.copy(index = i, text = text))) *>
+      ictl.hint.set(Some(hintFor(c.candidates, i))) *>
+      ui.refreshInput
+
+  private def accept(candidate: String): String =
+    if candidate.endsWith("/") then candidate else candidate + " "
+
+  private def hintFor(candidates: List[String], selected: Int): String =
+    candidates.zipWithIndex
+      .map((c, i) => if i == selected then s"[$c]" else c)
+      .mkString("  ")
 
   private def splitLastToken(s: String): (String, String) =
     val i = s.lastIndexOf(' ')

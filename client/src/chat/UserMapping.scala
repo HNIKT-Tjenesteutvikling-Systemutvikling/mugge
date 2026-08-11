@@ -15,10 +15,12 @@ final class LiveUserMapping private () extends UserMapping:
       case "intervbs"       => "Joran"
       case "jca"            => "Jan-Olov"
       case "neethan"        => "Neethan"
+      case "neethan-hnikt"  => "Neethan"
       case "sigubrat"       => "Sigurd"
       case "williams"       => "Sigurd"
       case "shitbox"        => "Leif"
       case "ketil"          => "Ketil"
+      case "work"           => "Kristian"
       case other            => other
 
 object LiveUserMapping:
