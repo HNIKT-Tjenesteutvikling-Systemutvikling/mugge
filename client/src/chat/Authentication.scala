@@ -56,6 +56,13 @@ object Authentication:
 
   case class AuthChallenge(challenge: String, signature: Option[String])
 
+  val githubUserEnvVar = "MUGGE_GITHUB_USER"
+
+  val githubUserHint: String =
+    s"Set $githubUserEnvVar=<your-github-username>, or run " +
+      "'git config --global mugge.githubUser <your-github-username>' if your " +
+      "git user.name is not your GitHub username."
+
 final class LiveAuthentication[F[_]: Sync: LoggerFactory] private () extends Authentication[F]:
   import Authentication.*
 
@@ -305,20 +312,31 @@ final class LiveAuthentication[F[_]: Sync: LoggerFactory] private () extends Aut
       .blocking {
         Either
           .catchNonFatal {
-            Process(Seq("git", "config", "--global", "user.name")).!!.trim
+            val envUser =
+              sys.env.get(Authentication.githubUserEnvVar).map(_.trim).filter(_.nonEmpty)
+            resolveAuthorizedUser(envUser)
+              .orElse(resolveAuthorizedUser(gitConfig("mugge.githubUser")))
+              .orElse(resolveAuthorizedUser(gitConfig("github.user")))
+              .orElse(resolveAuthorizedUser(gitConfig("user.name")))
           }
           .leftMap(e => GitConfigError(s"Failed to read git config: ${e.getMessage}"))
-          .map { gitConfig =>
-            val username = gitConfig.toLowerCase match
-              case "merrinx" => "Gako358"
-              case "gako358" => "Gako358"
-              case _         => gitConfig
-            AuthorizedUser.values
-              .find(_.githubUsername.equalsIgnoreCase(username))
-              .map(_.githubUsername)
-          }
       }
       .flatMap(raiseFromEither)
+
+  private def gitConfig(key: String): Option[String] =
+    Either
+      .catchNonFatal(Process(Seq("git", "config", "--global", key)).!!.trim)
+      .toOption
+      .filter(_.nonEmpty)
+
+  private def resolveAuthorizedUser(candidate: Option[String]): Option[String] =
+    candidate.flatMap { raw =>
+      val username = raw.toLowerCase match
+        case "merrinx" => "Gako358"
+        case "gako358" => "Gako358"
+        case _         => raw
+      AuthorizedUser.values.find(_.githubUsername.equalsIgnoreCase(username)).map(_.githubUsername)
+    }
 
 object LiveAuthentication:
   def apply[F[_]: Sync: LoggerFactory](): Authentication[F] = new LiveAuthentication[F]()

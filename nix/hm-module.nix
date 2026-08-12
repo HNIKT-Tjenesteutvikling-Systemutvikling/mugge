@@ -40,6 +40,17 @@ in
         further configuration is needed.
       '';
     };
+
+    githubUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "neethan";
+      description = ''
+        Your GitHub username, used for key-based authentication against the
+        server. Only needed when your global git `user.name` is not your
+        GitHub username (the client falls back to it otherwise).
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -57,7 +68,9 @@ in
 
       Service = {
         Type = "simple";
-        Environment = [ "MUGGE_SERVICE=1" ];
+        Environment = [
+          "MUGGE_SERVICE=1"
+        ] ++ lib.optional (cfg.githubUser != null) "MUGGE_GITHUB_USER=${cfg.githubUser}";
         ExecStartPre = "${pkgs.coreutils}/bin/rm -f ${socketUnit}";
         ExecStart = ''${pkgs.dtach}/bin/dtach -N ${socketUnit} -e "^\\" ${cfg.package}/bin/mugge-azure'';
         Restart = "on-failure";

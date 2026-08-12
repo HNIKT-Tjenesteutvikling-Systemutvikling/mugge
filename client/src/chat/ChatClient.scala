@@ -103,7 +103,12 @@ object ChatClient extends IOApp:
       _ <- logger.info(s"The github username is: ${githubUsername}")
       _ <- githubUsername match
         case Some(ghu) => logger.debug(s"Detected GitHub username: $ghu")
-        case None      => logger.error("Could not detect GitHub username from git config")
+        case None =>
+          logger.error(
+            s"Could not detect GitHub username. ${Authentication.githubUserHint}"
+          ) *> IO.println(
+            s"Could not detect your GitHub username. ${Authentication.githubUserHint}"
+          )
 
       _ <- IO.whenA(insecureTls)(IO.println(Config.insecureTlsNotice))
       tlsContext <- if insecureTls then Network[IO].tlsContext.insecure else tls.pinnedContext
