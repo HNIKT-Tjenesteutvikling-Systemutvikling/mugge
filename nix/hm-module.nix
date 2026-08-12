@@ -70,7 +70,8 @@ in
         Type = "simple";
         Environment = [
           "MUGGE_SERVICE=1"
-        ] ++ lib.optional (cfg.githubUser != null) "MUGGE_GITHUB_USER=${cfg.githubUser}";
+        ]
+        ++ lib.optional (cfg.githubUser != null) "MUGGE_GITHUB_USER=${cfg.githubUser}";
         ExecStartPre = "${pkgs.coreutils}/bin/rm -f ${socketUnit}";
         ExecStart = ''${pkgs.dtach}/bin/dtach -N ${socketUnit} -e "^\\" ${cfg.package}/bin/mugge-azure'';
         Restart = "on-failure";
