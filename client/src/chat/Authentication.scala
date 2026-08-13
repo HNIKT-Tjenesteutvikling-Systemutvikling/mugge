@@ -49,6 +49,7 @@ object Authentication:
     case TurboNaepskrel extends AuthorizedUser("TurboNaepskrel")
     case LeifEggenfellner extends AuthorizedUser("leifeggenfellner")
     case Knotilla extends AuthorizedUser("knotilla")
+    case VebjornHal extends AuthorizedUser("VebjornHal")
 
   enum AdminUser(val githubUsername: String):
     case Gako358 extends AdminUser("Gako358")
