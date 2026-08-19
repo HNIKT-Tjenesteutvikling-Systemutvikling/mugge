@@ -14,6 +14,8 @@ trait Completion[F[_]]:
 
 final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
   private val clientCommands = List(
+    "!note",
+    "!notes",
     "!remind",
     "!reminders",
     "/acceptfile",

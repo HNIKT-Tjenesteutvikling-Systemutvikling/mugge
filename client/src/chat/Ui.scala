@@ -23,6 +23,7 @@ trait Ui[F[_]]:
       code: List[String]
   ): F[Unit]
   def setUsers(users: List[String]): F[Unit]
+  def setColors(colors: Map[String, ColorSpec]): F[Unit]
   def setStatuses(name: String, status: Option[String]): F[Unit]
   def setVoiceUsers(users: List[String]): F[Unit]
   def setTyping(users: List[String]): F[Unit]
@@ -80,8 +81,8 @@ final class LiveUi[F[_]: Async: Console] private (
       lang: String,
       code: List[String]
   ): F[Unit] =
-    colorIndexFor(sender, state).flatMap { idx =>
-      val header = s"[$time] $indicator ${ansiPalette(idx)}$sender$ansiReset:"
+    specFor(sender, state).flatMap { spec =>
+      val header = s"[$time] $indicator ${paintName(sender, spec, shimmer(time))}:"
       termSize.get.flatMap {
         case None =>
           val open = if lang.nonEmpty then s"${Markup.fence}$lang" else Markup.fence
@@ -109,6 +110,19 @@ final class LiveUi[F[_]: Async: Console] private (
             }
           }
       }
+
+  override def setColors(colors: Map[String, ColorSpec]): F[Unit] =
+    state.modify(st => (st.copy(serverColors = colors), st.serverColors != colors)).flatMap {
+      changed =>
+        if !changed then Applicative[F].unit
+        else
+          mutex.lock.surround {
+            termSize.get.flatMap {
+              case None               => Applicative[F].unit
+              case Some((cols, rows)) => render(None, cols, rows)
+            }
+          }
+    }
 
   override def setStatuses(name: String, status: Option[String]): F[Unit] =
     state
@@ -180,13 +194,13 @@ final class LiveUi[F[_]: Async: Console] private (
           (s"[$time] $indicator $serverColor$sender$ansiReset: " +
             s"$serverColor${ansi.linkify(content)}$ansiReset").pure[F]
         else
-          (colorIndexFor(sender.trim, state), state.get).flatMapN { (idx, st) =>
-            val bright = ansiPalette(idx)
-            val dim = ansiDimPalette(idx)
+          (specFor(sender.trim, state), state.get).flatMapN { (spec, st) =>
+            val offset = shimmer(time)
+            val dim = dimOf(spec, offset)
             val status =
               if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
             val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
-            (s"[$time] $indicator $bright$sender$ansiReset$statusPart: " +
+            (s"[$time] $indicator ${paintName(sender, spec, offset)}$statusPart: " +
               s"$dim${ansi.linkify(content)}$ansiReset").pure[F]
           }
       case _ => msg.pure[F]
@@ -228,9 +242,7 @@ final class LiveUi[F[_]: Async: Console] private (
       clearRows = math.min(rows - 1, 30)
       visible = st.onlineUsers.take(math.max(0, clearRows - 1))
       colored <- visible.traverse(u =>
-        colorIndexFor(u, state).map(idx =>
-          (u, ansiPalette(idx), ansiDimPalette(idx), st.statuses.get(u).filter(_.nonEmpty))
-        )
+        specFor(u, state).map(spec => (u, spec, st.statuses.get(u).filter(_.nonEmpty)))
       )
       (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
       sb = new StringBuilder
@@ -256,9 +268,7 @@ final class LiveUi[F[_]: Async: Console] private (
       clearRows = math.min(rows - 1, 30)
       visible = st.onlineUsers.take(math.max(0, clearRows - 1))
       colored <- visible.traverse(u =>
-        colorIndexFor(u, state).map(idx =>
-          (u, ansiPalette(idx), ansiDimPalette(idx), st.statuses.get(u).filter(_.nonEmpty))
-        )
+        specFor(u, state).map(spec => (u, spec, st.statuses.get(u).filter(_.nonEmpty)))
       )
       (blockStr, newCount) = renderBlock(st, inp, paste, hint, textWidth, rows)
       sb = new StringBuilder
@@ -310,7 +320,7 @@ final class LiveUi[F[_]: Async: Console] private (
     (all.map(r => s"\r\u001b[2K$r").mkString("\n"), all.size)
 
   private def panelStr(
-      colored: List[(String, String, String, Option[String])],
+      colored: List[(String, ColorSpec, Option[String])],
       voice: Set[String],
       total: Int,
       startCol: Int,
@@ -319,26 +329,21 @@ final class LiveUi[F[_]: Async: Console] private (
     val clears =
       (1 to clearRows).map(r => s"\u001b[$r;${startCol}H" + " " * panelWidth).mkString
     val header = s"\u001b[1;${startCol}H\u001b[1m\u2524 Online ($total)\u001b[0m"
-    val entries = colored.zipWithIndex.map { case ((u, color, dim, status), i) =>
+    val entries = colored.zipWithIndex.map { case ((u, spec, status), i) =>
       val bullet = if voice.contains(u) then "\u266a" else "\u2022"
-      s"\u001b[${2 + i};${startCol}H$color$bullet ${panelLabel(u, status, color, dim)}"
+      s"\u001b[${2 + i};${startCol}H${brightOf(spec, 0)}$bullet ${panelLabel(u, status, spec)}"
     }.mkString
     s"\u001b7$clears$header$entries\u001b8"
 
-  private def panelLabel(
-      name: String,
-      status: Option[String],
-      bright: String,
-      dim: String
-  ): String =
+  private def panelLabel(name: String, status: Option[String], spec: ColorSpec): String =
     val avail = math.max(1, panelWidth - 2)
     status match
       case Some(s) if name.length <= avail - 4 =>
         val room = avail - name.length - 3
         val shown = if s.length > room then s.take(room - 1) + "\u2026" else s
-        s"$bright$name$ansiReset$dim ($shown)$ansiReset"
+        s"${paintName(name, spec, 0)}${dimOf(spec, 0)} ($shown)$ansiReset"
       case _ =>
-        s"$bright${if name.length > avail then name.take(avail) else name}$ansiReset"
+        paintName(if name.length > avail then name.take(avail) else name, spec, 0)
 
   private def formatTyping(users: List[String]): Option[String] =
     users match
@@ -348,17 +353,47 @@ final class LiveUi[F[_]: Async: Console] private (
         val init = users.init.mkString(", ")
         Some(s"$init and ${users.last} is typing...")
 
-  private def colorIndexFor(name: String, state: Ref[F, ClientState[F]]): F[Int] =
+  /** The server assigns colours so all clients agree; names it did not send (history from users who
+    * have since left) fall back to a locally assigned palette slot.
+    */
+  private def specFor(name: String, state: Ref[F, ClientState[F]]): F[ColorSpec] =
     state.modify { st =>
-      st.colors.get(name) match
-        case Some(idx) => (st, idx)
+      st.serverColors.get(name) match
+        case Some(spec) => (st, spec)
         case None =>
-          val live = (st.onlineUsers.toSet - name).flatMap(st.colors.get)
-          val idx = ansiPalette.indices
-            .find(!live.contains(_))
-            .getOrElse(st.colors.size % ansiPalette.size)
-          (st.copy(colors = st.colors + (name -> idx)), idx)
+          st.colors.get(name) match
+            case Some(idx) => (st, ColorSpec.Palette(idx))
+            case None =>
+              val live = (st.onlineUsers.toSet - name).flatMap(u =>
+                st.serverColors
+                  .get(u)
+                  .collect { case ColorSpec.Palette(i) => i }
+                  .orElse(st.colors.get(u))
+              )
+              val idx = ansiPalette.indices
+                .find(!live.contains(_))
+                .getOrElse(st.colors.size % ansiPalette.size)
+              (st.copy(colors = st.colors + (name -> idx)), ColorSpec.Palette(idx))
     }
+
+  private def paintName(name: String, spec: ColorSpec, offset: Int): String =
+    spec match
+      case ColorSpec.Palette(i) => s"${ansiPalette(i)}$name$ansiReset"
+      case ColorSpec.Rainbow    => Ansi.rainbow(name, offset)
+
+  private def brightOf(spec: ColorSpec, offset: Int): String =
+    spec match
+      case ColorSpec.Palette(i) => ansiPalette(i)
+      case ColorSpec.Rainbow    => rainbowPalette(offset % rainbowPalette.size)
+
+  private def dimOf(spec: ColorSpec, offset: Int): String =
+    spec match
+      case ColorSpec.Palette(i) => ansiDimPalette(i)
+      case ColorSpec.Rainbow    => rainbowDimPalette(offset % rainbowDimPalette.size)
+
+  /** Rainbow names shift hue per message so they shimmer down the scrollback. */
+  private def shimmer(time: String): Int =
+    math.floorMod(time.hashCode, rainbowPalette.size)
 
 object LiveUi:
   def apply[F[_]: Async: Console](

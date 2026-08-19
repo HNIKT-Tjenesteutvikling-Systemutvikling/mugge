@@ -21,7 +21,7 @@ object Config:
   val insecureTlsNotice =
     "⚠ --insecure-tls: the server certificate is NOT verified. Local dev only."
 
-  val protocolVersion = 9
+  val protocolVersion = 10
 
   val serviceMode: Boolean = sys.env.get("MUGGE_SERVICE").contains("1")
 

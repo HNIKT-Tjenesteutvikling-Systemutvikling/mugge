@@ -2,6 +2,16 @@ package chat
 
 import scala.util.matching.Regex
 
+/** How a user's name is painted. The server dictates it so every client agrees. */
+enum ColorSpec:
+  case Palette(index: Int)
+  case Rainbow
+
+object ColorSpec:
+  def parse(s: String): Option[ColorSpec] =
+    if s == "rainbow" then Some(Rainbow)
+    else s.toIntOption.filter(Ansi.ansiPalette.indices.contains).map(Palette(_))
+
 trait Ansi:
   def wrapAnsi(s: String, width: Int): List[String]
   def visibleWidth(s: String): Int
@@ -47,6 +57,17 @@ object Ansi:
   val ansiPalette: Vector[String] = paletteCodes.map(c => s"\u001b[38;5;${c}m")
 
   val ansiDimPalette: Vector[String] = paletteCodes.map(c => s"\u001b[38;5;${dimmed(c)}m")
+
+  private val rainbowCodes: Vector[Int] = Vector(196, 208, 226, 46, 51, 21, 129)
+
+  val rainbowPalette: Vector[String] = rainbowCodes.map(c => s"\u001b[38;5;${c}m")
+
+  val rainbowDimPalette: Vector[String] = rainbowCodes.map(c => s"\u001b[38;5;${dimmed(c)}m")
+
+  def rainbow(s: String, offset: Int): String =
+    s.zipWithIndex
+      .map((ch, i) => s"${rainbowPalette((i + offset) % rainbowPalette.size)}$ch")
+      .mkString + ansiReset
 
   val serverColor = "\u001b[38;5;245m"
 

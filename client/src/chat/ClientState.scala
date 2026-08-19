@@ -8,6 +8,7 @@ final case class ClientState[F[_]](
     githubUsername: Option[String] = None,
     privateKey: Option[PrivateKey] = None,
     colors: Map[String, Int] = Map.empty,
+    serverColors: Map[String, ColorSpec] = Map.empty,
     onlineUsers: List[String] = Nil,
     typingUsers: List[String] = Nil,
     statuses: Map[String, String] = Map.empty,

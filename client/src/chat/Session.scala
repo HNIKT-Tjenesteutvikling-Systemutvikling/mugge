@@ -350,6 +350,18 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
                   val trimmed = text.trim
                   ui.setStatuses(name.trim, if trimmed.isEmpty then None else Some(trimmed))
                 case _ => ().pure[F]
+            else if msg.startsWith("COLORS:") then
+              val specs = msg
+                .drop("COLORS:".length)
+                .split(",")
+                .map(_.trim)
+                .filter(_.nonEmpty)
+                .flatMap(_.split("=", 2) match
+                  case Array(name, spec) => ColorSpec.parse(spec).map(name.trim -> _)
+                  case _                 => None
+                )
+                .toMap
+              ui.setColors(specs)
             else if msg.startsWith("USERS:") then
               val users = msg.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
               ui.setUsers(users) *> ipc.users(users)
