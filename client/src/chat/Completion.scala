@@ -14,11 +14,14 @@ trait Completion[F[_]]:
 
 final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
   private val clientCommands = List(
+    "!list",
     "!note",
     "!notes",
+    "!ping",
     "!remind",
     "!reminders",
     "/acceptfile",
+    "/admins",
     "/help",
     "/mute",
     "/nick",
@@ -26,12 +29,17 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
     "/r",
     "/rejectfile",
     "/sendfile",
+    "/status",
     "/voice",
     "/voicetest",
     "/w"
   )
 
-  private val adminCommands = List("/ban", "/kick", "/server", "/unmute")
+  private val adminCommands =
+    List("/ban", "/caffeine", "/clearhistory", "/kick", "/server", "/unmute")
+
+  /** Commands whose argument is a bare display name, not an `@mention`. */
+  private val nameArgCommands = Set("/ban", "/kick")
 
   override def complete(state: Ref[F, ClientState[F]], ui: Ui[F], ictl: InputCtl[F]): F[Unit] =
     ictl.pendingPaste.get.flatMap {
@@ -112,6 +120,8 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
         .map(k => s":$k:")
         .pure[F]
     else if inp.startsWith("/sendfile ") && head.nonEmpty then completePath(token)
+    else if nameArgCommands.contains(head.trim) then
+      st.onlineUsers.filter(_.toLowerCase.startsWith(token.toLowerCase)).sorted.pure[F]
     else List.empty[String].pure[F]
 
   private def completePath(token: String): F[List[String]] =
