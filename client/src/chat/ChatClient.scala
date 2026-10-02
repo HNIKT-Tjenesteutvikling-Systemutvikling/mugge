@@ -41,6 +41,7 @@ object ChatClient extends IOApp:
     val fileTransfer = LiveFileTransfer[IO](notifications)
     val voice = LiveVoice[IO](audio)
     val assist = LiveAssist[IO](notifications, emoji)
+    val reactions = LiveReactions[IO]()
     val userInput =
       LiveUserInput[IO](completion, fileTransfer, voice, assist, markup, emoji, tokenizer)
     val session = LiveSession[IO](
@@ -53,6 +54,7 @@ object ChatClient extends IOApp:
       whisper,
       fileTransfer,
       assist,
+      reactions,
       markup,
       ansi,
       highlighter

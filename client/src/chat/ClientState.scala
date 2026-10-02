@@ -21,5 +21,6 @@ final case class ClientState[F[_]](
     assistSessions: Map[String, AssistSession[F]] = Map.empty[String, AssistSession[F]],
     pendingAssist: List[(String, String)] = Nil,
     isAdmin: Boolean = false,
-    adminMuted: Boolean = false
+    adminMuted: Boolean = false,
+    lastMessageId: Option[Int] = None
 )
