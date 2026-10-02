@@ -252,6 +252,8 @@ final class LiveUserInput[F[_]: Async: Console] private (
     else if line == "/mute" then voice.toggleMute(state, ui, voiceRef)
     else if line.equalsIgnoreCase("yes") || line.equalsIgnoreCase("no") then
       assist.answerConsent(line.equalsIgnoreCase("yes"), line, state, outgoingQueue, ui)
+    else if line == "/react" || line == "/unreact" then
+      ui.printLine(s"Usage: $line <id> <emoji>   or   $line <emoji> (reacts to the last message)")
     else if line.startsWith("/react ") || line.startsWith("/unreact ") then
       resolveReact(line, state, outgoingQueue, ui)
     else if line.startsWith("/") then outgoingQueue.offer(line)
