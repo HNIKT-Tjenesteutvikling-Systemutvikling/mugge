@@ -61,7 +61,7 @@ object Emoji:
 
   /** The fixed set of emoji reactable via /react — must match the server's ReactionEmoji.curated.
     */
-  val curated: List[String] = List("👍", "❤️", "😂", "🎉", "😮", "😢", "🙏", "🔥")
+  val curated: List[String] = List("👍", "❤️", "😂", "🎉", "😮", "😢", "🙏", "🔥", "🤡")
 
   val emoticons: Map[String, String] = Map(
     ":)" -> "🙂",
