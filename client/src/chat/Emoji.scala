@@ -63,6 +63,21 @@ object Emoji:
     */
   val curated: List[String] = List("👍", "❤️", "😂", "🎉", "😮", "😢", "🙏", "🔥", "🤡")
 
+  /** Typing-friendly keywords for /react and /unreact, one per curated emoji — handy in the
+    * terminal where pasting the glyph itself is tiresome. Matched case-insensitively.
+    */
+  val reactionKeywords: Map[String, String] = Map(
+    "thumbsup" -> "👍",
+    "heart" -> "❤️",
+    "joy" -> "😂",
+    "tada" -> "🎉",
+    "wow" -> "😮",
+    "cry" -> "😢",
+    "pray" -> "🙏",
+    "fire" -> "🔥",
+    "clown" -> "🤡"
+  )
+
   val emoticons: Map[String, String] = Map(
     ":)" -> "🙂",
     ":(" -> "🙁",
