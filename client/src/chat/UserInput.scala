@@ -246,6 +246,7 @@ final class LiveUserInput[F[_]: Async: Console] private (
       if Config.serviceMode then ui.printLine(Config.quitHint) else halt.complete(Right(())).void
     else if line.startsWith("/sendfile ") then
       fileTransfer.prepareSend(line.drop(10), state, outgoingQueue, ui)
+    else if line == "/clown" then outgoingQueue.offer(List.fill(20)("🤡").mkString(" "))
     else if line == "/voice" then voice.toggle(state, outgoingQueue, ui, voiceRef)
     else if line == "/voicetest" then voice.toggleTest(state, outgoingQueue, ui, voiceRef)
     else if line == "/mute" then voice.toggleMute(state, ui, voiceRef)
