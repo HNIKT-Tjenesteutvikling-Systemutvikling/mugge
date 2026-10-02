@@ -7,6 +7,11 @@ trait Markup:
 
 object Markup:
   val displayPattern =
+    """^#(\d+) \[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
+
+  /** Server-authored lines (no reactable id) and any pre-upgrade history replay still match this.
+    */
+  val legacyDisplayPattern =
     """^\[(\d{2}:\d{2}:\d{2})\] ([✓?]) ([^:]+): (.*)$""".r
 
   val fence = "'''"

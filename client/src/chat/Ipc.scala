@@ -21,6 +21,7 @@ import org.typelevel.log4cats.LoggerFactory
   */
 trait Ipc[F[_]]:
   def message(
+      id: Int,
       time: String,
       indicator: String,
       sender: String,
@@ -29,6 +30,7 @@ trait Ipc[F[_]]:
   ): F[Unit]
 
   def codeMessage(
+      id: Int,
       time: String,
       indicator: String,
       sender: String,
@@ -42,6 +44,8 @@ trait Ipc[F[_]]:
   def users(list: List[String]): F[Unit]
   def typing(list: List[String]): F[Unit]
   def me(name: String): F[Unit]
+  def reaction(id: Int, emoji: String, user: String, added: Boolean): F[Unit]
+  def reactions(id: Int, counts: Map[String, Set[String]]): F[Unit]
 
   /** Holds the input sink of the live session; frontends can only send while it is bound. */
   def bind(send: String => F[Unit]): Resource[F, Unit]
@@ -50,7 +54,7 @@ trait Ipc[F[_]]:
 
 object Ipc:
   /** Bumped when the event shape changes incompatibly. */
-  val ipcProtocol = 1
+  val ipcProtocol = 2
 
   final case class Snapshot(
       me: String,
@@ -103,6 +107,7 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
   private val ansiPattern = "\u001b\\[[0-9;?]*[ -/]*[@-~]".r
 
   override def message(
+      id: Int,
       time: String,
       indicator: String,
       sender: String,
@@ -112,6 +117,7 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
     emit(
       obj(
         "type" -> str("message"),
+        "id" -> num(id),
         "time" -> str(time),
         "sender" -> str(sender),
         "verified" -> bool(indicator == "✓"),
@@ -121,6 +127,7 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
     )
 
   override def codeMessage(
+      id: Int,
       time: String,
       indicator: String,
       sender: String,
@@ -131,6 +138,7 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
     emit(
       obj(
         "type" -> str("message"),
+        "id" -> num(id),
         "time" -> str(time),
         "sender" -> str(sender),
         "verified" -> bool(indicator == "✓"),
@@ -166,6 +174,26 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
   override def me(name: String): F[Unit] =
     snapshot.update(_.copy(me = name)) *>
       emit(obj("type" -> str("me"), "name" -> str(name)), remember = false)
+
+  override def reaction(id: Int, emoji: String, user: String, added: Boolean): F[Unit] =
+    emit(
+      obj(
+        "type" -> str("reaction"),
+        "id" -> num(id),
+        "emoji" -> str(emoji),
+        "user" -> str(user),
+        "added" -> bool(added)
+      )
+    )
+
+  override def reactions(id: Int, counts: Map[String, Set[String]]): F[Unit] =
+    emit(
+      obj(
+        "type" -> str("reactions"),
+        "id" -> num(id),
+        "counts" -> obj(counts.toSeq.map((e, us) => e -> arr(us.toList))*)
+      )
+    )
 
   override def bind(send: String => F[Unit]): Resource[F, Unit] =
     Resource.make(sink.set(Some(send)) *> connection(true))(_ =>

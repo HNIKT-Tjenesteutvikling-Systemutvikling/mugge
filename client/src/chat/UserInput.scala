@@ -251,9 +251,38 @@ final class LiveUserInput[F[_]: Async: Console] private (
     else if line == "/mute" then voice.toggleMute(state, ui, voiceRef)
     else if line.equalsIgnoreCase("yes") || line.equalsIgnoreCase("no") then
       assist.answerConsent(line.equalsIgnoreCase("yes"), line, state, outgoingQueue, ui)
+    else if line.startsWith("/react ") || line.startsWith("/unreact ") then
+      resolveReact(line, state, outgoingQueue, ui)
     else if line.startsWith("/") then outgoingQueue.offer(line)
     else if markup.inlineCode(line).isDefined then outgoingQueue.offer(line)
     else outgoingQueue.offer(emoji.expand(line))
+
+  /** "/react <emoji>" (no id) reacts to the most recently received message; "/react <id> <emoji>"
+    * targets a specific one. Resolved here so the server only ever sees the two-argument form.
+    */
+  private def resolveReact(
+      line: String,
+      state: Ref[F, ClientState[F]],
+      outgoingQueue: Queue[F, String],
+      ui: Ui[F]
+  ): F[Unit] =
+    val spaceIdx = line.indexOf(' ')
+    val cmd = line.take(spaceIdx)
+    val args = line.drop(spaceIdx + 1).trim
+    val usage = s"Usage: $cmd <id> <emoji>   or   $cmd <emoji> (reacts to the last message)"
+    args.split("\\s+", 2) match
+      case Array(idStr, emojiArg) if idStr.toIntOption.isDefined =>
+        if !Emoji.curated.contains(emojiArg) then
+          ui.printLine(s"Unknown reaction emoji. Try: ${Emoji.curated.mkString(" ")}")
+        else outgoingQueue.offer(s"$cmd $idStr $emojiArg")
+      case Array(emojiOnly) if Emoji.curated.contains(emojiOnly) =>
+        state.get.map(_.lastMessageId).flatMap {
+          case Some(id) => outgoingQueue.offer(s"$cmd $id $emojiOnly")
+          case None     => ui.printLine("No recent message to react to.")
+        }
+      case Array(notEmoji) if notEmoji.nonEmpty =>
+        ui.printLine(s"Unknown reaction emoji. Try: ${Emoji.curated.mkString(" ")}")
+      case _ => ui.printLine(usage)
 
   private def startTyping(
       outgoingQueue: Queue[F, String],

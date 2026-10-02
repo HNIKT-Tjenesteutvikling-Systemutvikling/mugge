@@ -39,6 +39,7 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
     whisper: Whisper[F],
     fileTransfer: FileTransfer[F],
     assist: Assist[F],
+    reactions: Reactions[F],
     markup: Markup,
     ansi: Ansi,
     highlighter: Highlighter
@@ -344,6 +345,10 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
                 ipc,
                 live = false
               )
+            else if msg.startsWith("REACT:") then
+              reactions.incoming(msg.drop("REACT:".length), ui, ipc)
+            else if msg.startsWith("REACTIONS:") then
+              reactions.snapshot(msg.drop("REACTIONS:".length), ipc)
             else if msg.startsWith("STATUS:") then
               msg.split(":", 3) match
                 case Array(_, name, text) =>
@@ -405,6 +410,14 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
         .drain
     }
 
+  private def parseDisplay(msg: String): Option[(Int, String, String, String, String)] =
+    msg match
+      case Markup.displayPattern(id, time, indicator, sender, content) =>
+        id.toIntOption.map(i => (i, time, indicator, sender, content))
+      case Markup.legacyDisplayPattern(time, indicator, sender, content) =>
+        Some((0, time, indicator, sender, content))
+      case _ => None
+
   private def handleIncomingChat(
       msg: String,
       me: String,
@@ -414,11 +427,13 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
       ipc: Ipc[F],
       live: Boolean = true
   ): F[Unit] =
+    val parsed = parseDisplay(msg)
+
     def publish: F[Unit] =
-      msg match
-        case Markup.displayPattern(time, indicator, sender, content) =>
-          ipc.message(time, indicator, sender.trim, content, history = !live)
-        case _ => ipc.notice(msg)
+      parsed match
+        case Some((id, time, indicator, sender, content)) =>
+          ipc.message(id, time, indicator, sender.trim, content, history = !live)
+        case None => ipc.notice(msg)
 
     def plain: F[Unit] =
       publish >>
@@ -426,41 +441,54 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
            ui.colorize(msg, state).flatMap(ui.printLine) >> notifications.mentions(msg, me)
          else ui.colorize(msg, state, withStatus = false).flatMap(ui.printLine))
 
-    msg match
-      case Markup.displayPattern(time, indicator, senderRaw, content) =>
-        val sender = senderRaw.trim
-        codeAccum.get.flatMap { accums =>
-          accums.get(sender) match
-            case Some(acc) if content.startsWith("│") =>
-              val body = acc.body :+ content.stripPrefix("│ ").stripPrefix("│")
-              if acc.remaining <= 1 then
-                codeAccum.update(_ - sender) *>
-                  renderCodeBody(time, indicator, sender, body, ui, ipc, history = !live)
-              else codeAccum.update(_ + (sender -> CodeAccum(acc.remaining - 1, body)))
-            case _ =>
-              content match
-                case Markup.codeHeaderPattern(n) =>
-                  n.toIntOption.filter(_ > 0) match
-                    case Some(count) =>
-                      codeAccum.update(_ + (sender -> CodeAccum(count, Vector.empty)))
-                    case None => plain
-                case _ =>
-                  markup.inlineCode(content) match
-                    case Some(code) =>
-                      renderCodeBody(
-                        time,
-                        indicator,
-                        sender,
-                        Vector(code),
-                        ui,
-                        ipc,
-                        history = !live
-                      )
-                    case None => plain
-        }
-      case _ => plain
+    def trackLastId: F[Unit] =
+      if !live then ().pure[F]
+      else
+        parsed match
+          case Some((id, _, _, _, _)) if id > 0 =>
+            state.update(_.copy(lastMessageId = Some(id)))
+          case _ => ().pure[F]
+
+    val render: F[Unit] =
+      parsed match
+        case Some((id, time, indicator, senderRaw, content)) =>
+          val sender = senderRaw.trim
+          codeAccum.get.flatMap { accums =>
+            accums.get(sender) match
+              case Some(acc) if content.startsWith("│") =>
+                val body = acc.body :+ content.stripPrefix("│ ").stripPrefix("│")
+                if acc.remaining <= 1 then
+                  codeAccum.update(_ - sender) *>
+                    renderCodeBody(id, time, indicator, sender, body, ui, ipc, history = !live)
+                else codeAccum.update(_ + (sender -> CodeAccum(acc.remaining - 1, body)))
+              case _ =>
+                content match
+                  case Markup.codeHeaderPattern(n) =>
+                    n.toIntOption.filter(_ > 0) match
+                      case Some(count) =>
+                        codeAccum.update(_ + (sender -> CodeAccum(count, Vector.empty)))
+                      case None => plain
+                  case _ =>
+                    markup.inlineCode(content) match
+                      case Some(code) =>
+                        renderCodeBody(
+                          id,
+                          time,
+                          indicator,
+                          sender,
+                          Vector(code),
+                          ui,
+                          ipc,
+                          history = !live
+                        )
+                      case None => plain
+          }
+        case None => plain
+
+    render *> trackLastId
 
   private def renderCodeBody(
+      id: Int,
       time: String,
       indicator: String,
       sender: String,
@@ -472,7 +500,7 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
     val (lang, code) = body.headOption.flatMap(markup.fenceLang) match
       case Some(l) => (l, body.drop(1).dropRight(1).toList)
       case None    => ("", body.toList)
-    ipc.codeMessage(time, indicator, sender, lang, code, history) *>
+    ipc.codeMessage(id, time, indicator, sender, lang, code, history) *>
       ui.printCodeBlock(time, indicator, sender, lang, code)
 
   private def handleAutoChallenge(
@@ -530,6 +558,7 @@ object LiveSession:
       whisper: Whisper[F],
       fileTransfer: FileTransfer[F],
       assist: Assist[F],
+      reactions: Reactions[F],
       markup: Markup,
       ansi: Ansi,
       highlighter: Highlighter
@@ -544,6 +573,7 @@ object LiveSession:
       whisper,
       fileTransfer,
       assist,
+      reactions,
       markup,
       ansi,
       highlighter

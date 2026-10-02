@@ -188,21 +188,26 @@ final class LiveUi[F[_]: Async: Console] private (
       state: Ref[F, ClientState[F]],
       withStatus: Boolean = true
   ): F[String] =
+    def paint(time: String, indicator: String, sender: String, content: String): F[String] =
+      if sender.trim == "SERVER" then
+        (s"[$time] $indicator $serverColor$sender$ansiReset: " +
+          s"$serverColor${ansi.linkify(content)}$ansiReset").pure[F]
+      else
+        (specFor(sender.trim, state), state.get).flatMapN { (spec, st) =>
+          val offset = shimmer(time)
+          val dim = dimOf(spec, offset)
+          val status =
+            if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
+          val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
+          (s"[$time] $indicator ${paintName(sender, spec, offset)}$statusPart: " +
+            s"$dim${ansi.linkify(content)}$ansiReset").pure[F]
+        }
+
     msg match
-      case Markup.displayPattern(time, indicator, sender, content) =>
-        if sender.trim == "SERVER" then
-          (s"[$time] $indicator $serverColor$sender$ansiReset: " +
-            s"$serverColor${ansi.linkify(content)}$ansiReset").pure[F]
-        else
-          (specFor(sender.trim, state), state.get).flatMapN { (spec, st) =>
-            val offset = shimmer(time)
-            val dim = dimOf(spec, offset)
-            val status =
-              if withStatus then st.statuses.get(sender.trim).filter(_.nonEmpty) else None
-            val statusPart = status.fold("")(s => s" $dim($s)$ansiReset")
-            (s"[$time] $indicator ${paintName(sender, spec, offset)}$statusPart: " +
-              s"$dim${ansi.linkify(content)}$ansiReset").pure[F]
-          }
+      case Markup.displayPattern(_, time, indicator, sender, content) =>
+        paint(time, indicator, sender, content)
+      case Markup.legacyDisplayPattern(time, indicator, sender, content) =>
+        paint(time, indicator, sender, content)
       case _ => msg.pure[F]
 
   private def plainPrint(line: String): F[Unit] =
