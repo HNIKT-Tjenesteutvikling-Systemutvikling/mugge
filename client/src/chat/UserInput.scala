@@ -252,16 +252,28 @@ final class LiveUserInput[F[_]: Async: Console] private (
     else if line == "/mute" then voice.toggleMute(state, ui, voiceRef)
     else if line.equalsIgnoreCase("yes") || line.equalsIgnoreCase("no") then
       assist.answerConsent(line.equalsIgnoreCase("yes"), line, state, outgoingQueue, ui)
-    else if line == "/react" || line == "/unreact" then
-      ui.printLine(s"Usage: $line <id> <emoji>   or   $line <emoji> (reacts to the last message)")
+    else if line == "/react" || line == "/unreact" then ui.printLine(reactUsage(line))
     else if line.startsWith("/react ") || line.startsWith("/unreact ") then
       resolveReact(line, state, outgoingQueue, ui)
     else if line.startsWith("/") then outgoingQueue.offer(line)
     else if markup.inlineCode(line).isDefined then outgoingQueue.offer(line)
     else outgoingQueue.offer(emoji.expand(line))
 
-  /** "/react <emoji>" (no id) reacts to the most recently received message; "/react <id> <emoji>"
-    * targets a specific one. Resolved here so the server only ever sees the two-argument form.
+  private def reactUsage(cmd: String): String =
+    s"Usage: $cmd <id> <emoji|keyword>   or   $cmd <emoji|keyword> (reacts to the last message)\n" +
+      s"  Emoji: ${Emoji.curated.mkString(" ")}\n" +
+      s"  Keywords: ${Emoji.reactionKeywords.keys.toList.sorted.mkString(", ")}"
+
+  /** Accepts either the literal curated emoji or one of Emoji.reactionKeywords (case-insensitive) —
+    * typing a word is a lot less tiresome than pasting the glyph in a terminal.
+    */
+  private def resolveEmoji(token: String): Option[String] =
+    if Emoji.curated.contains(token) then Some(token)
+    else Emoji.reactionKeywords.get(token.toLowerCase)
+
+  /** "/react <emoji|keyword>" (no id) reacts to the most recently received message; "/react <id>
+    * <emoji|keyword>" targets a specific one. Resolved here so the server only ever sees the
+    * two-argument form with a literal emoji.
     */
   private def resolveReact(
       line: String,
@@ -272,20 +284,21 @@ final class LiveUserInput[F[_]: Async: Console] private (
     val spaceIdx = line.indexOf(' ')
     val cmd = line.take(spaceIdx)
     val args = line.drop(spaceIdx + 1).trim
-    val usage = s"Usage: $cmd <id> <emoji>   or   $cmd <emoji> (reacts to the last message)"
+    val unknown = s"Unknown reaction. ${reactUsage(cmd)}"
     args.split("\\s+", 2) match
       case Array(idStr, emojiArg) if idStr.toIntOption.isDefined =>
-        if !Emoji.curated.contains(emojiArg) then
-          ui.printLine(s"Unknown reaction emoji. Try: ${Emoji.curated.mkString(" ")}")
-        else outgoingQueue.offer(s"$cmd $idStr $emojiArg")
-      case Array(emojiOnly) if Emoji.curated.contains(emojiOnly) =>
-        state.get.map(_.lastMessageId).flatMap {
-          case Some(id) => outgoingQueue.offer(s"$cmd $id $emojiOnly")
-          case None     => ui.printLine("No recent message to react to.")
-        }
-      case Array(notEmoji) if notEmoji.nonEmpty =>
-        ui.printLine(s"Unknown reaction emoji. Try: ${Emoji.curated.mkString(" ")}")
-      case _ => ui.printLine(usage)
+        resolveEmoji(emojiArg) match
+          case Some(emoji) => outgoingQueue.offer(s"$cmd $idStr $emoji")
+          case None        => ui.printLine(unknown)
+      case Array(single) if single.nonEmpty =>
+        resolveEmoji(single) match
+          case Some(emoji) =>
+            state.get.map(_.lastMessageId).flatMap {
+              case Some(id) => outgoingQueue.offer(s"$cmd $id $emoji")
+              case None     => ui.printLine("No recent message to react to.")
+            }
+          case None => ui.printLine(unknown)
+      case _ => ui.printLine(reactUsage(cmd))
 
   private def startTyping(
       outgoingQueue: Queue[F, String],

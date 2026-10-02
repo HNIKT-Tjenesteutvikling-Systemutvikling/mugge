@@ -27,9 +27,11 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
     "/nick",
     "/quit",
     "/r",
+    "/react",
     "/rejectfile",
     "/sendfile",
     "/status",
+    "/unreact",
     "/voice",
     "/voicetest",
     "/w"
@@ -40,6 +42,8 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
 
   /** Commands whose argument is a bare display name, not an `@mention`. */
   private val nameArgCommands = Set("/ban", "/kick")
+
+  private val reactCommands = Set("/react", "/unreact")
 
   override def complete(state: Ref[F, ClientState[F]], ui: Ui[F], ictl: InputCtl[F]): F[Unit] =
     ictl.pendingPaste.get.flatMap {
@@ -120,6 +124,11 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
         .map(k => s":$k:")
         .pure[F]
     else if inp.startsWith("/sendfile ") && head.nonEmpty then completePath(token)
+    else if reactCommands.contains(head.trim.split("\\s+", 2).headOption.getOrElse("")) then
+      Emoji.reactionKeywords.keys.toList
+        .filter(_.toLowerCase.startsWith(token.toLowerCase))
+        .sorted
+        .pure[F]
     else if nameArgCommands.contains(head.trim) then
       st.onlineUsers.filter(_.toLowerCase.startsWith(token.toLowerCase)).sorted.pure[F]
     else List.empty[String].pure[F]
