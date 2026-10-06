@@ -353,7 +353,8 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
               msg.split(":", 3) match
                 case Array(_, name, text) =>
                   val trimmed = text.trim
-                  ui.setStatuses(name.trim, if trimmed.isEmpty then None else Some(trimmed))
+                  val status = if trimmed.isEmpty then None else Some(trimmed)
+                  ui.setStatuses(name.trim, status) *> ipc.status(name.trim, status)
                 case _ => ().pure[F]
             else if msg.startsWith("COLORS:") then
               val specs = msg
@@ -382,7 +383,7 @@ final class LiveSession[F[_]: Async: Console: LoggerFactory] private (
             else if msg.startsWith("VOICEUSERS:") then
               val users =
                 msg.drop("VOICEUSERS:".length).split(",").map(_.trim).filter(_.nonEmpty).toList
-              ui.setVoiceUsers(users)
+              ui.setVoiceUsers(users) *> ipc.voice(users)
             else if msg.startsWith("VOICE:") then
               msg.split(":", 4) match
                 case Array(_, from, _, b64) =>
