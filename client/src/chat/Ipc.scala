@@ -43,6 +43,8 @@ trait Ipc[F[_]]:
   def notice(text: String): F[Unit]
   def users(list: List[String]): F[Unit]
   def typing(list: List[String]): F[Unit]
+  def status(name: String, text: Option[String]): F[Unit]
+  def voice(list: List[String]): F[Unit]
   def me(name: String): F[Unit]
   def reaction(id: Int, emoji: String, user: String, added: Boolean): F[Unit]
   def reactions(id: Int, counts: Map[String, Set[String]]): F[Unit]
@@ -60,7 +62,9 @@ object Ipc:
       me: String,
       users: List[String],
       typing: List[String],
-      connected: Boolean
+      connected: Boolean,
+      statuses: Map[String, String] = Map.empty,
+      voice: List[String] = Nil
   )
 
   /** Just enough JSON to render flat event objects; no parser is needed on this side. */
@@ -171,6 +175,19 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
     snapshot.update(_.copy(typing = list)) *>
       emit(obj("type" -> str("typing"), "users" -> arr(list)), remember = false)
 
+  override def status(name: String, text: Option[String]): F[Unit] =
+    snapshot.update(s =>
+      s.copy(statuses = text.fold(s.statuses - name)(t => s.statuses + (name -> t)))
+    ) *>
+      emit(
+        obj("type" -> str("status"), "name" -> str(name), "text" -> str(text.getOrElse(""))),
+        remember = false
+      )
+
+  override def voice(list: List[String]): F[Unit] =
+    snapshot.update(_.copy(voice = list)) *>
+      emit(obj("type" -> str("voice"), "users" -> arr(list)), remember = false)
+
   override def me(name: String): F[Unit] =
     snapshot.update(_.copy(me = name)) *>
       emit(obj("type" -> str("me"), "name" -> str(name)), remember = false)
@@ -269,6 +286,8 @@ final class LiveIpc[F[_]: Async: Network: Files: LoggerFactory] private (
         "me" -> str(snap.me),
         "users" -> arr(snap.users),
         "typing" -> arr(snap.typing),
+        "statuses" -> obj(snap.statuses.toSeq.map((n, t) => n -> str(t))*),
+        "voice" -> arr(snap.voice),
         "connected" -> bool(snap.connected)
       ) :: buffered.toList
     }
