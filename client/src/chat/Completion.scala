@@ -22,6 +22,7 @@ final class LiveCompletion[F[_]: Async: Files] private () extends Completion[F]:
     "!reminders",
     "/acceptfile",
     "/admins",
+    "/giphy",
     "/help",
     "/mute",
     "/nick",
